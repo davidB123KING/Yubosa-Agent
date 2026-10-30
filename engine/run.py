@@ -49,8 +49,9 @@ def load_data(data_dir: Path, symbol: str, tf: str) -> tuple[pd.DataFrame, dict]
 
 
 def combo_label(combo: dict) -> str:
-    on = [k for k, v in combo.items() if v]
-    return "+".join(on) if on else "base"
+    on = [k for k, v in combo.items() if v is True]
+    nums = [f"{k}{v}" for k, v in combo.items() if not isinstance(v, bool)]
+    return "+".join(on or ["base"]) + ("_" + "_".join(nums) if nums else "")
 
 
 def plot(tr: pd.DataFrame, split_time, balance: float, title: str, path: Path) -> None:
@@ -125,7 +126,10 @@ def main() -> None:
     strat = load_strategy(args.strategy)
     pairs = [p.strip() for p in args.pairs.split(",") if p.strip()]
     names = list(strat.addons)
-    combos = [dict(zip(names, bits)) for bits in itertools.product([False, True], repeat=len(names))]
+    grid = getattr(strat, "param_grid", {}) or {}
+    keys = names + list(grid)
+    values = [[False, True]] * len(names) + [list(v) for v in grid.values()]
+    combos = [dict(zip(keys, vals)) for vals in itertools.product(*values)]
     ratio, balance = cfg["in_sample_ratio"], cfg["account_balance"]
 
     data = {p: load_data(Path(args.data_dir), p, args.tf) for p in pairs}
@@ -160,7 +164,7 @@ def main() -> None:
             for vz, m in (("in", m_in), ("out", m_out)):
                 db.insert_result(con, tid, p, combo, vz, m, graf)
                 rows.append({"par": p, "kombinacija": label, "vzorec": vz, **m})
-            if k % 16 == 0 or k == len(combos):
+            if k % max(16, len(combos) // 20) == 0 or k == len(combos):
                 print(f"  {p}: {k}/{len(combos)} kombinacij ({time.time() - t0:.0f} s)", flush=True)
         if pool:
             pool.shutdown()

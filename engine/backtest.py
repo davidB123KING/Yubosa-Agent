@@ -156,7 +156,8 @@ def price_trades(raw: pd.DataFrame, df: pd.DataFrame, meta: dict, cfg: dict, sym
     d = tr["dir"].to_numpy(int)
     entry, exit_, sl = tr["entry"].to_numpy(float), tr["exit"].to_numpy(float), tr["sl"].to_numpy(float)
     dist = np.abs(entry - sl) + sp  # dejanska razdalja do SL vključno s spreadom
-    lots = np.array([lot_size(x, meta, cfg) if x > 0 else 0.0 for x in dist])
+    size_dist = tr["risk_dist"].to_numpy(float) if "risk_dist" in tr else dist
+    lots = np.array([lot_size(x, meta, cfg) if x > 0 else 0.0 for x in size_dist])
     move = (exit_ - entry) * d - sp
     tr["lots"] = lots
     tr["risk"] = dist / ts * tv * lots

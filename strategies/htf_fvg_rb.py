@@ -140,6 +140,12 @@ class HtfFvgRb(Strategy):
         "nwog_filter": False,        # useNWOG
         "trailing_sl": False,        # useTrail
     }
+    # Izvedba na MT5 prek webhooka: lot iz originalnega SL (signal), SL dejansko odmaknjen
+    # za sl_buffer točk, BE postavljen be_offset točk v minus.
+    param_grid = {
+        "sl_buffer": [0, 1, 2, 3, 4, 5],
+        "be_offset": [0, 1, 2, 3, 4, 5],
+    }
     params = P
 
     # ══════════════════════════════════════════════════════════════════════
@@ -572,7 +578,7 @@ class HtfFvgRb(Strategy):
     # ══════════════════════════════════════════════════════════════════════
     # Vodenje pozicije (BE, alt BE, trailing) – normaliziran prostor: short = negirane cene
     # ══════════════════════════════════════════════════════════════════════
-    def _position(self, X, s, f, ePx, sl0, tp, fill_px, use_trail):
+    def _position(self, X, s, f, ePx, sl0, tp, fill_px, use_trail, be_off=0.0):
         n = X["n"]
         TL = self.params["trailPivLen"]
         use_alt = self.params["useAltBE"]
@@ -587,8 +593,10 @@ class HtfFvgRb(Strategy):
         e, SL, TP, fp = ePx * s, sl0 * s, tp * s, fill_px * s
         be, ext, profT, alt = False, e, -1, None
 
+        be_lvl = e - be_off  # BE raven (be_off točk v minusu, da je ne pobere spread)
+
         def why(sl):
-            return "trail" if sl > e else ("be" if sl == e else "sl")
+            return "trail" if sl > e else ("be" if be and sl >= be_lvl - 1e-9 else "sl")
 
         W = 256
         k = f
@@ -630,8 +638,8 @@ class HtfFvgRb(Strategy):
                         hit = True
                     if hit:
                         be = True
-                        if e > SL:
-                            SL = e
+                        if be_lvl > SL:
+                            SL = be_lvl
                     elif use_alt and alt is None and profT >= 0:
                         for qi in range(dn_ptr[k], dn_ptr[k + 1]):
                             if dn_lv[qi] * s < e and dn_pv[qi] >= f and profT > dn_pv[qi]:
@@ -712,6 +720,8 @@ class HtfFvgRb(Strategy):
 
         o, tarr = X["o"], X["time"]
         use_trail = bool(addons.get("trailing_sl"))
+        sl_buf = float(addons.get("sl_buffer", 0))   # točke: SL dodatno odmaknjen (MT5 izvedba)
+        be_off = float(addons.get("be_offset", 0))   # točke: BE toliko v minusu
         out = []
         free = 0
         while True:
@@ -728,10 +738,13 @@ class HtfFvgRb(Strategy):
             stop = abs(e - sl0)
             tp, src = self._targets(X, bull, e, stop, j)
             fp = min(o[f], e) if bull else max(o[f], e)
-            x, xp, why = self._position(X, s, f, e, sl0, tp, fp, use_trail)
-            out.append((tarr[f], tarr[x], s, fp, float(xp), sl0, tp, why, tarr[r[sid]], src, j, x))
+            sl_real = sl0 - s * sl_buf
+            x, xp, why = self._position(X, s, f, e, sl_real, tp, fp, use_trail, be_off)
+            # lot iz signala (TV): razdalja vstop - originalni SL, brez bufferja in spreada
+            out.append((tarr[f], tarr[x], s, fp, float(xp), sl_real, tp, why, stop,
+                        tarr[r[sid]], src, j, x))
             free = x
         if not out:
             return pd.DataFrame(columns=cols)
-        res = pd.DataFrame(out, columns=cols + ["rb_time", "tp_src", "order_bar", "exit_bar"])
+        res = pd.DataFrame(out, columns=cols + ["risk_dist", "rb_time", "tp_src", "order_bar", "exit_bar"])
         return res

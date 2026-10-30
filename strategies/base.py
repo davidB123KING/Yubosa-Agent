@@ -12,6 +12,9 @@ class Strategy:
     description: str = ""
     # Add-oni: ime -> privzeta vrednost (bool). Motor testira VSE kombinacije True/False.
     addons: dict[str, bool] = {}
+    # Številski parametri za testiranje: ime -> seznam vrednosti. Motor jih kombinira z add-oni
+    # (vse kombinacije) in jih poda v isti slovar kot add-one (addons["ime"] = vrednost).
+    param_grid: dict[str, list] = {}
     # Fiksni parametri strategije (ne kombinirajo se).
     params: dict = {}
 
@@ -44,6 +47,8 @@ class Strategy:
           sl                    : ZAČETNI stop loss (iz njega motor izračuna lot: risk_per_trade, max_lot)
           tp                    : (neobvezno) TP ob vstopu
           reason                : 'tp' / 'sl' / 'be' / 'trail' / 'end' ...
+          risk_dist             : (neobvezno) razdalja v ceni za izračun lota (npr. SL iz signala brez
+                                  bufferja). Če manjka, motor vzame |entry - sl| + spread.
         Motor nato doda spread (en spread na trade), provizijo, lote, pnl, R, metrike, IS/OOS, graf.
         Pravila: ena pozicija naenkrat, brez pogleda v prihodnost, če sta SL in TP zadeta v isti
         sveči, šteje SL."""

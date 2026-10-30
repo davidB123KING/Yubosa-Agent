@@ -98,7 +98,8 @@ def print_report(r: dict) -> None:
     print(f"Obdobje {r['obdobje'][0]} -> {r['obdobje'][1]} | kombinacij: {r['st_kombinacij']} | "
           f"robustnih: {r['st_robustnih']}\n")
     for k, c in enumerate(r["top5"], 1):
-        on = [a for a, v in c["kombinacija"].items() if v] or ["(brez add-onov)"]
+        on = [a for a, v in c["kombinacija"].items() if v is True] or ["(brez add-onov)"]
+        on += [f"{a}={v}" for a, v in c["kombinacija"].items() if not isinstance(v, bool)]
         print(f"{k}. {' + '.join(on)}  ->  {'ROBUSTNA' if c['robustna'] else 'ni robustna'}")
         print(f"   IS exp {c['avg_is_exp_r']:+.3f}R | OOS exp {c['avg_oos_exp_r']:+.3f}R | "
               f"OOS tradov {c['oos_tradi']} | OOS net {c['oos_net_profit']:+.2f} €")
