@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe engine/*)",
+      "Bash(.venv/Scripts/python.exe data/*)",
+      "Bash(python engine/*)",
+      "Bash(python data/*)",
+      "PowerShell(.venv\\Scripts\\python.exe engine/*)",
+      "PowerShell(.venv\\Scripts\\python.exe data/*)",
+      "PowerShell(.venv/Scripts/python.exe engine/*)",
+      "PowerShell(.venv/Scripts/python.exe data/*)",
+      "PowerShell(python engine/*)",
+      "PowerShell(python data/*)",
+      "Write(strategies/**)",
+      "Edit(strategies/**)"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(del:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(git push:*)",
+      "Bash(pip:*)",
+      "Bash(python -c:*)",
+      "Bash(.venv/Scripts/python.exe -c:*)",
+      "Bash(.venv/Scripts/python.exe -m:*)",
+      "Bash(.venv/Scripts/pip:*)",
+      "PowerShell(Remove-Item:*)",
+      "PowerShell(rm:*)",
+      "PowerShell(del:*)",
+      "PowerShell(Invoke-WebRequest:*)",
+      "PowerShell(Invoke-RestMethod:*)",
+      "PowerShell(iwr:*)",
+      "PowerShell(curl:*)",
+      "PowerShell(git push:*)",
+      "PowerShell(pip:*)",
+      "PowerShell(python -c:*)",
+      "PowerShell(.venv\\Scripts\\python.exe -c:*)",
+      "PowerShell(.venv\\Scripts\\python.exe -m:*)",
+      "Edit(engine/**)",
+      "Write(engine/**)",
+      "Edit(data/download.py)",
+      "Write(data/download.py)",
+      "Edit(.claude/**)",
+      "Write(.claude/**)"
+    ]
+  }
+}

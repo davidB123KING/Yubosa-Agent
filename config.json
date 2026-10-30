@@ -1,0 +1,18 @@
+{
+  "account_balance": 10000,
+  "account_currency": "EUR",
+  "risk_per_trade": 50,
+  "max_lot": 3.5,
+  "commission_per_lot": 0.0,
+  "spread_mode": "data",
+  "fixed_spread_points": {},
+  "in_sample_ratio": 0.7,
+  "default_timeframe": "M5",
+  "default_pairs": ["US30.cash"],
+  "robustness": {
+    "min_trades_per_pair": 100,
+    "min_profitable_pairs": 3,
+    "of_pairs": 5,
+    "max_oos_degradation": 0.5
+  }
+}
