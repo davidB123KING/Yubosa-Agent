@@ -26,7 +26,7 @@ TIMEFRAMES = {
     "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
     "D1": mt5.TIMEFRAME_D1,
 }
-CHUNK_DAYS = 90  # prenos po kosih, da obidemo omejitev "Max bars in chart"
+BATCH = 50_000  # svečk na en klic copy_rates_from_pos
 
 
 def save_meta(symbol: str) -> None:
@@ -42,23 +42,30 @@ def save_meta(symbol: str) -> None:
         "volume_step": info.volume_step,
         "volume_max": info.volume_max,
         "currency_profit": info.currency_profit,
+        "account_currency": mt5.account_info().currency,
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
     (DATA_DIR / f"{symbol}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def fetch(symbol: str, tf: int, start: datetime, end: datetime) -> pd.DataFrame:
-    frames = []
-    cur = start
-    while cur < end:
-        nxt = min(cur + timedelta(days=CHUNK_DAYS), end)
-        rates = mt5.copy_rates_range(symbol, tf, cur, nxt)
-        if rates is not None and len(rates):
-            frames.append(pd.DataFrame(rates))
-        cur = nxt
+def fetch(symbol: str, tf: int, start: datetime) -> pd.DataFrame:
+    """Od zadnje sveče nazaj v paketih (copy_rates_from_pos), dokler ne pridemo do start
+    ali MT5 nima več zgodovine. copy_rates_range po časovnih kosih ne deluje, kadar kos
+    sega čez omejitev 'Max bars in chart'."""
+    frames, pos = [], 0
+    start_ts = start.replace(tzinfo=None).timestamp() if start.tzinfo is None else start.timestamp()
+    while True:
+        rates = mt5.copy_rates_from_pos(symbol, tf, pos, BATCH)
+        if rates is None or len(rates) == 0:
+            break
+        frames.append(pd.DataFrame(rates))
+        pos += len(rates)
+        if rates["time"][0] <= start_ts or len(rates) < BATCH:
+            break
     if not frames:
         return pd.DataFrame()
     df = pd.concat(frames, ignore_index=True)
+    df = df[df["time"] >= start_ts]
     df["time"] = pd.to_datetime(df["time"], unit="s")
     df = df[["time", "open", "high", "low", "close", "tick_volume", "spread"]]
     return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
@@ -81,7 +88,7 @@ def download(symbol: str, tf_name: str, years: float, force: bool) -> None:
         if len(old):
             start = old["time"].max().to_pydatetime().replace(tzinfo=timezone.utc)
 
-    new = fetch(symbol, TIMEFRAMES[tf_name], start, end)
+    new = fetch(symbol, TIMEFRAMES[tf_name], start)
     df = new if old is None else pd.concat([old, new]).drop_duplicates("time", keep="last")
     df = df.sort_values("time").reset_index(drop=True)
     if df.empty:
@@ -92,6 +99,13 @@ def download(symbol: str, tf_name: str, years: float, force: bool) -> None:
     save_meta(symbol)
     print(f"[OK] {symbol} {tf_name}: {len(df):,} barov ({df['time'].min()} -> {df['time'].max()}), "
           f"novih {len(new):,} -> {out.name}")
+    want = pd.Timestamp(start.replace(tzinfo=None)) + pd.Timedelta(days=7)
+    if old is None and df["time"].min() > want:
+        maxbars = mt5.terminal_info().maxbars
+        print(f"[OPOZORILO] Zgodovina sega le do {df['time'].min():%Y-%m-%d} (zahtevano {start:%Y-%m-%d}). "
+              f"MT5 'Max bars in chart' = {maxbars:,}.\n"
+              f"  Za več: MT5 > Orodja > Možnosti > Grafi > 'Največ stolpcev v grafu' = Unlimited, "
+              f"ponovno zaženi MT5, odpri graf {symbol} {tf_name} in podrsaj nazaj (Home), nato ponovi z --force.")
 
 
 def main() -> None:

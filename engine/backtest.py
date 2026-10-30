@@ -130,6 +130,42 @@ def simulate(df: pd.DataFrame, sig: pd.DataFrame, meta: dict, cfg: dict, symbol:
     return pd.DataFrame(trades)
 
 
+def price_trades(raw: pd.DataFrame, df: pd.DataFrame, meta: dict, cfg: dict, symbol: str) -> pd.DataFrame:
+    """Za strategije, ki same simulirajo trade-e (Strategy.simulate_trades).
+
+    raw: entry_time, exit_time, dir (1/-1), entry, exit, sl (ZAČETNI SL), reason – vse na bid cenah.
+    Motor doda: velikost lota (fiksni risk na začetni SL, max_lot), spread (en spread na trade,
+    vzet na sveči vstopa – long ga plača ob vstopu, short ob izhodu), provizijo, pnl in R.
+    """
+    cols = ["entry_time", "exit_time", "dir", "entry", "exit", "sl", "tp", "lots", "risk", "pnl", "r", "reason"]
+    if raw is None or len(raw) == 0:
+        return pd.DataFrame(columns=cols)
+    tr = raw.copy().reset_index(drop=True)
+    if "tp" not in tr:
+        tr["tp"] = np.nan
+
+    if cfg.get("spread_mode") == "fixed":
+        sp = np.full(len(tr), cfg["fixed_spread_points"][symbol] * meta["point"])
+    else:
+        sp_series = pd.Series(df["spread"].to_numpy(float) * meta["point"], index=df["time"])
+        sp_series = sp_series[~sp_series.index.duplicated()]
+        sp = sp_series.reindex(pd.DatetimeIndex(tr["entry_time"]), method="ffill").fillna(0).to_numpy()
+
+    tv, ts = meta["tick_value"], meta["tick_size"]
+    comm = cfg.get("commission_per_lot", 0.0)
+    d = tr["dir"].to_numpy(int)
+    entry, exit_, sl = tr["entry"].to_numpy(float), tr["exit"].to_numpy(float), tr["sl"].to_numpy(float)
+    dist = np.abs(entry - sl) + sp  # dejanska razdalja do SL vključno s spreadom
+    lots = np.array([lot_size(x, meta, cfg) if x > 0 else 0.0 for x in dist])
+    move = (exit_ - entry) * d - sp
+    tr["lots"] = lots
+    tr["risk"] = dist / ts * tv * lots
+    tr["pnl"] = move / ts * tv * lots - comm * lots
+    tr["r"] = tr["pnl"] / cfg["risk_per_trade"]
+    tr = tr[lots > 0]
+    return tr[cols].reset_index(drop=True)
+
+
 def metrics(tr: pd.DataFrame, balance: float) -> dict:
     if tr.empty:
         return dict(st_tradov=0, win_rate=0.0, profit_factor=0.0, expectancy_r=0.0,

@@ -37,10 +37,6 @@
       "PowerShell(python -c:*)",
       "PowerShell(.venv\\Scripts\\python.exe -c:*)",
       "PowerShell(.venv\\Scripts\\python.exe -m:*)",
-      "Edit(engine/**)",
-      "Write(engine/**)",
-      "Edit(data/download.py)",
-      "Write(data/download.py)",
       "Edit(.claude/**)",
       "Write(.claude/**)"
     ]

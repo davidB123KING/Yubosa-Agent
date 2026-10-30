@@ -8,7 +8,10 @@ import importlib
 import inspect
 import itertools
 import json
+import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,7 +24,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from engine import db  # noqa: E402
-from engine.backtest import metrics, simulate  # noqa: E402
+from engine.backtest import metrics, price_trades, simulate  # noqa: E402
 from strategies.base import Strategy  # noqa: E402
 
 LINE, SURFACE, INK, MUTED, OOS_FILL = "#2a78d6", "#fcfcfb", "#0b0b0b", "#52514e", "#ecebe8"
@@ -73,6 +76,38 @@ def plot(tr: pd.DataFrame, split_time, balance: float, title: str, path: Path) -
     plt.close(fig)
 
 
+_W: dict = {}  # stanje delovnega procesa (en par)
+
+
+def _init_worker(strategy, df, meta, cfg, symbol, split_time, plots, out_dir, tf) -> None:
+    strat = load_strategy(strategy)
+    _W.update(strategy=strategy, strat=strat, df=df, meta=meta, cfg=cfg, symbol=symbol,
+              split_time=split_time, plots=plots, out_dir=Path(out_dir), tf=tf,
+              ctx=strat.prepare(df))  # skupni izračuni enkrat na par
+
+
+def _run_combo(combo: dict):
+    w = _W
+    strat, df = w["strat"], w["df"]
+    if strat.uses_own_simulation():
+        raw = strat.simulate_trades(df, combo, w["ctx"])
+        tr = price_trades(raw, df, w["meta"], w["cfg"], w["symbol"])
+    else:
+        sig = strat.generate_signals(df, combo)
+        tr = simulate(df, sig, w["meta"], w["cfg"], w["symbol"])
+    label = combo_label(combo)
+    balance = w["cfg"]["account_balance"]
+    graf = None
+    if w["plots"] == "all":
+        path = w["out_dir"] / f"{w['symbol']}_{label}.png"
+        plot(tr, w["split_time"], balance, f"{w['strategy']} | {w['symbol']} {w['tf']} | {label}", path)
+        graf = str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+    st = w["split_time"]
+    is_tr = tr[tr["entry_time"] < st] if not tr.empty else tr
+    oos_tr = tr[tr["entry_time"] >= st] if not tr.empty else tr
+    return combo, label, graf, metrics(is_tr, balance), metrics(oos_tr, balance)
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     cfg = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
@@ -84,6 +119,7 @@ def main() -> None:
     ap.add_argument("--data-dir", default=str(ROOT / "data"))
     ap.add_argument("--db", default=str(ROOT / "bohak.db"))
     ap.add_argument("--results-dir", default=str(ROOT / "results"))
+    ap.add_argument("--workers", type=int, default=0, help="število procesov (0 = vsa jedra - 1)")
     args = ap.parse_args()
 
     strat = load_strategy(args.strategy)
@@ -104,25 +140,30 @@ def main() -> None:
     if args.plots == "all":
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Test #{tid}: {args.strategy} | {len(combos)} kombinacij × {len(pairs)} parov | {args.tf} | {od} -> {do}")
+    workers = max(1, min(args.workers or (os.cpu_count() or 2) - 1, len(combos)))
+    mode = "simulate_trades" if strat.uses_own_simulation() else "signali"
+    print(f"Test #{tid}: {args.strategy} | {len(combos)} kombinacij × {len(pairs)} parov | {args.tf} | "
+          f"{od} -> {do} | način: {mode} | procesov: {workers}")
     rows = []
+    t0 = time.time()
     for p, (df, meta) in data.items():
-        split_time = pd.Timestamp(split[p])
-        for combo in combos:
-            sig = strat.generate_signals(df, combo)
-            tr = simulate(df, sig, meta, cfg, p)
-            label = combo_label(combo)
-            graf = None
-            if args.plots == "all":
-                graf = out_dir / f"{p}_{label}.png"
-                plot(tr, split_time, balance, f"{args.strategy} | {p} {args.tf} | {label}", graf)
-                graf = str(graf.relative_to(ROOT)) if graf.is_relative_to(ROOT) else str(graf)
-            is_tr = tr[tr["entry_time"] < split_time] if not tr.empty else tr
-            oos_tr = tr[tr["entry_time"] >= split_time] if not tr.empty else tr
-            for vz, part in (("in", is_tr), ("out", oos_tr)):
-                m = metrics(part, balance)
+        init = (args.strategy, df, meta, cfg, p, pd.Timestamp(split[p]), args.plots,
+                str(out_dir), args.tf)
+        if workers == 1:
+            _init_worker(*init)
+            results = map(_run_combo, combos)
+            pool = None
+        else:
+            pool = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=init)
+            results = pool.map(_run_combo, combos)
+        for k, (combo, label, graf, m_in, m_out) in enumerate(results, 1):
+            for vz, m in (("in", m_in), ("out", m_out)):
                 db.insert_result(con, tid, p, combo, vz, m, graf)
                 rows.append({"par": p, "kombinacija": label, "vzorec": vz, **m})
+            if k % 16 == 0 or k == len(combos):
+                print(f"  {p}: {k}/{len(combos)} kombinacij ({time.time() - t0:.0f} s)", flush=True)
+        if pool:
+            pool.shutdown()
         con.commit()
     con.close()
 
