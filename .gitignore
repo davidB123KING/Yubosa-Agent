@@ -34,3 +34,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# bohak-trader
+.venv/
+__pycache__/
+data/*.parquet
+data/*_meta.json
+results/
+bohak.db

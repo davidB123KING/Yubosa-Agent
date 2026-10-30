@@ -1,0 +1,1449 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+strategy("HTF FVG + 15m RB Strategy", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.fixed, pyramiding = 1,
+     margin_long = 1, margin_short = 1,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0,
+     max_boxes_count = 200, max_labels_count = 500, max_lines_count = 500)
+
+// ══════════════════════════════════════════════════════════════════════
+// SETTINGS
+// ══════════════════════════════════════════════════════════════════════
+
+groupFVG = "HTF FVG"
+groupRB = "15m Rejection Blocks"
+groupStyle = "Style"
+groupDelivery = "RB HTF FVG Delivery"
+
+minFVG = input.float(5.0, "Minimum FVG size ($)", minval = 0.0, group = groupFVG)
+
+// 5-minute FVGs are removed completely (no option).
+useTF15  = input.bool(true, "15m", group = groupFVG)
+useTF60  = input.bool(true, "1h",  group = groupFVG)
+useTF240 = input.bool(true, "4h",  group = groupFVG)
+useTFD   = input.bool(true, "1D",  group = groupFVG)
+
+showFVG = input.bool(true, "Show nearest HTF FVGs", group = groupFVG)
+
+showRB = input.bool(true, "Show rejection blocks", tooltip = "Draws the wick zones of confirmed two-candle 15-minute rejection-block patterns.", group = groupRB)
+showBullRB = input.bool(true, "Bullish RBs", tooltip = "The first 15-minute candle is bearish and the second is bullish. Lower wicks are marked.", group = groupRB)
+showBearRB = input.bool(true, "Bearish RBs", tooltip = "The first 15-minute candle is bullish and the second is bearish. Upper wicks are marked.", group = groupRB)
+maxRBInput = input.int(40, "Maximum RBs", minval = 1, maxval = 80, tooltip = "Maximum number of rejection-block wick boxes retained on the chart.", group = groupRB)
+hideDeadRB = input.bool(true, "Skrij RB-je brez vstopa", tooltip = "Ko je setup preklican (prebit, pobran ekstrem ali konec seje) brez vstopa, se njegov box in črta izbrišeta z grafa. Ostanejo samo RB-ji, ki so dali entry, in tisti, ki še čakajo.", group = groupRB)
+
+// ── Shooting star filter ──
+groupPat = "Filter: Shooting Star"
+filterStarBear   = input.bool(true, "Izloči bearish RB s shooting star na vrhu", tooltip = "1m sveča, ki naredi najvišjo točko sveč A+B, ima dolg zgornji fitil (daljši od telesa) in kratek spodnji fitil. Tak RB se ne nariše.", group = groupPat)
+filterHammerBull = input.bool(true, "Izloči bullish RB s hammerjem na dnu", tooltip = "Zrcalno: 1m sveča z najnižjo točko A+B ima dolg spodnji fitil in kratek zgornji.", group = groupPat)
+starWickRatio    = input.float(1.0, "Min. razmerje fitil / telo", minval = 0.5, step = 0.1, tooltip = "1.0 = enako kot LuxAlgo (fitil daljši od telesa). Višje = strožje.", group = groupPat)
+markFiltered     = input.bool(true, "Označi izločene RB-je", tooltip = "Na izločeni sveči nariše majhen siv ✘, da lahko preveriš filter.", group = groupPat)
+
+reqBBigger = input.bool(false, "Candle B must be bigger than candle A", tooltip = "For a bearish RB the bearish candle B must be larger than the bullish candle A (and vice versa for a bullish RB).", group = groupRB)
+sizeMode = input.string("Wick", "Size measured as", options = ["Wick", "Full range", "Body"], tooltip = "Wick = only the wick pointing in the rejection direction. Full range = high - low. Body = |close - open|.", group = groupRB)
+minSizeRatio = input.float(1.0, "Minimum B / A size ratio", minval = 0.1, maxval = 10.0, step = 0.1, group = groupRB)
+showSizeDebug = input.bool(false, "Debug: show A/B candle sizes", group = groupRB)
+
+reqStandalone = input.bool(true, "B must exceed the preceding candle", group = groupRB)
+standaloneRatio = input.float(1.0, "Minimum B / previous candle ratio", minval = 0.1, maxval = 10.0, step = 0.1, group = groupRB)
+standaloneMode = input.string("Beyond previous extreme", "B vs previous measured as", options = ["Beyond previous extreme", "Full range", "Wick", "Body"], group = groupRB)
+
+reqLiqSweep = input.bool(true, "Require liquidity sweep", group = groupRB)
+reqSweepInsideRB = input.bool(true, "Swept level must sit inside the RB zone", tooltip = "Enabling this implies a sweep is required.", group = groupRB)
+sweepTolerance = input.float(1.0, "Sweep tolerance ($)", minval = 0.0, step = 0.5, group = groupRB)
+pivotLenLiq = input.int(5, "Liquidity pivot length", minval = 1, tooltip = "Use this indicator on a 1-minute chart.", group = groupRB)
+
+bullRBColor = input.color(#089981, "Bullish RB color", group = groupStyle)
+bearRBColor = input.color(#f23645, "Bearish RB color", group = groupStyle)
+rbTransparency = input.int(80, "RB fill transparency", minval = 0, maxval = 100, group = groupStyle)
+
+// ── Invalidation level ──
+groupInval = "RB Invalidation Level"
+showInvalLine = input.bool(true, "Prikaži invalidation črto", tooltip = "Črtkana črta na ekstremu obeh 15m sveč v smeri giba. Bullish RB = najvišja točka obeh sveč, bearish RB = najnižja. Če cena to raven pobere po formiranju RB-ja, je setup pokvarjen.", group = groupInval)
+invalLineBars = input.int(5, "Dolžina črte (15m sveče)", minval = 1, maxval = 50, group = groupInval)
+invalLineWidth = input.int(1, "Debelina črte", minval = 1, maxval = 5, group = groupInval)
+reqInvalidation = input.bool(true, "Prekliči setup, če cena pobere to raven", tooltip = "Dokler setup čaka na prvi dotik vstopne cone, cena ne sme preseči ekstrema obeh 15m sveč. Če ga, se setup izbriše in do vstopa ne pride.", group = groupInval)
+
+reqFVGDelivery = input.bool(true, "Require HTF FVG delivery for valid RB", tooltip = "A matching-direction HTF FVG must be touched by candle A or B's wick, without either candle's body closing through it.", group = groupDelivery)
+useDeliv15  = input.bool(true, "15m", group = groupDelivery)
+useDeliv60  = input.bool(true, "1h",  group = groupDelivery)
+useDeliv240 = input.bool(true, "4h",  group = groupDelivery)
+useDelivD   = input.bool(false, "1D", tooltip = "Dnevni FVG-ji štejejo kot veljavna HTF dostava. Privzeto izklopljeno, ker so zelo široki. Zahteva vklopljen '1D' v skupini HTF FVG.", group = groupDelivery)
+
+reqDailyBias = input.bool(true, "Block setups against an enclosing daily FVG", group = groupDelivery)
+
+groupFib = "Fib Retracement / Entry"
+fibLevel = input.float(0.786, "Fib level", minval = 0.0, maxval = 1.0, step = 0.001, group = groupFib)
+reqPullback = input.bool(false, "Require move away before entry", group = groupFib)
+maxFibInput = input.int(40, "Maximum tracked fib setups", minval = 1, maxval = 80, group = groupFib)
+fibLegColor = input.color(color.new(color.yellow, 40), "Fib leg line color", group = groupFib)
+fib786Color = input.color(color.new(color.orange, 0), "Fib level line color", group = groupFib)
+
+// ── Entry markers ──
+groupMarker = "Entry Markers"
+showMarkers = input.bool(true, "Show entry, stop and target circles", group = groupMarker)
+showTP = input.bool(true, "Show take-profit circle", group = groupMarker)
+tpRR = input.float(4.0, "Rezervni TP (R), če ni HH/LL ali session tarče", minval = 0.1, step = 0.5, tooltip = "Uporabi se samo, ko nad entryjem (long) oz. pod njim (short) ni nobenega HH/LL ali session high/low.", group = groupMarker)
+showBE = input.bool(true, "Show break-even circle", group = groupMarker)
+longEntryDotColor  = input.color(color.new(color.green, 0),  "Barva kroga - LONG entry",  group = groupMarker)
+shortEntryDotColor = input.color(color.new(color.yellow, 0), "Barva kroga - SHORT entry", group = groupMarker)
+slDotColor         = input.color(color.new(color.white, 0),  "Barva kroga - SL",          group = groupMarker)
+tpDotColor         = input.color(color.new(color.orange, 0), "Barva kroga - TP",          group = groupMarker)
+beDotColor         = input.color(color.new(color.aqua, 0),   "Barva kroga - BE",          group = groupMarker)
+showGradeLine = input.bool(true, "Show grading line next to entries", tooltip = "Horizontal line from the entry candle with the grade; hover the label for contract size.", group = groupMarker)
+longGradeLineColor  = input.color(#2962FF, "Long grading line color", group = groupMarker)
+shortGradeLineColor = input.color(#f23645, "Short grading line color", group = groupMarker)
+gradeLineBars       = input.int(20, "Grading line length (bars)", minval = 1, maxval = 200, group = groupMarker)
+gradeLineWidth      = input.int(3, "Grading line width", minval = 1, maxval = 10, group = groupMarker)
+
+// ── Risk ──
+groupRisk = "Risk and Position Sizing"
+riskPerTrade = input.float(50.0, "Risk per trade (10k račun = 0.5%)", minval = 0.0, step = 1.0, group = groupRisk)
+valuePerPoint = input.float(1.0, "Value per point per contract", minval = 0.0001, step = 0.1, tooltip = "NAS100 = 1 by default. Check your broker's specs.", group = groupRisk)
+maxLots = input.float(3.5, "Max. lotov (prop firm limit)", minval = 0.01, step = 0.1, tooltip = "Če izračun za 50 risk-a da več lotov, se vzame ta limit. Takrat je risk manjši od 50.", group = groupRisk)
+
+// ── Trading session ──
+groupSess = "Trading Session"
+useSession = input.bool(true, "Only show setups inside the session", tooltip = "New rejection blocks and entries are only allowed inside this time window.", group = groupSess)
+sessWindow = input.session("0900-2200", "Session", tooltip = "Local time in the timezone below. Default 09:00-22:00.", group = groupSess)
+sessTZ = input.string("Europe/Ljubljana", "Timezone", options = ["Europe/Ljubljana", "UTC", "America/New_York", "Europe/London"], tooltip = "Europe/Ljubljana = Slovenian time. Automatically switches between CET (UTC+1, winter) and CEST (UTC+2, summer).", group = groupSess)
+useBlackout = input.bool(true, "Blokiraj vstope v oknu", tooltip = "V tem času ni nobenega vstopa. Setupi ostanejo in lahko dajo vstop po koncu okna.", group = groupSess)
+blackoutWindow = input.session("1525-1530", "Okno brez vstopov", group = groupSess)
+cancelAtSessEnd = input.bool(true, "Cancel pending setups when the session ends", tooltip = "On: every setup still waiting for its entry is removed at session end, so nothing carries over to the next day. Off: pending setups survive the night, but can only trigger an entry inside the session.", group = groupSess)
+
+// ── Session high / low ──
+groupSessLv = "Session High / Low"
+showSessLevels = input.bool(true, "Prikaži session high/low črte", tooltip = "Ko se session konča, se nariše njegov high in low. Črta se podaljšuje, dokler cena ravni ne pobere.", group = groupSessLv)
+asiaSess   = input.session("0300-0700", "Asia",   group = groupSessLv)
+londonSess = input.session("0900-1200", "London", group = groupSessLv)
+nyamSess   = input.session("1530-1800", "NY AM",  group = groupSessLv)
+nypmSess   = input.session("2030-2200", "NY PM",  group = groupSessLv)
+sessLvlColor = input.color(color.new(color.gray, 20), "Barva session črt", group = groupSessLv)
+
+// ── TP / BE ──
+groupTgt = "TP / BE"
+hhLen = input.int(21, "HH / LL pivot dolžina", minval = 2, tooltip = "Enako kot LuxAlgo (21). Swing high, ki je višji od prejšnjega swing higha = HH. Swing low, nižji od prejšnjega = LL.", group = groupTgt)
+useAltBE = input.bool(true, "BE po sweepu likvidnosti v minusu", tooltip = "Long: po entryju se v minusu naredi likvidnost (pivot low), cena gre nato v profit (a ne do BE), potem pa pobere to likvidnost. Od takrat je BE na najvišji točki od entryja. Short: zrcalno.", group = groupTgt)
+useSessTP = input.bool(true, "Session high/low pred HH/LL je TP", tooltip = "Long: če je med entryjem in prvim HH še nepobran session high, je TP tam. Short: zrcalno s session low in LL.", group = groupTgt)
+minSessRR = input.float(1.0, "Min. RR za session TP", minval = 0.0, step = 0.1, tooltip = "Če je session high/low bližje od tega (v R), se ga preskoči in TP gre do HH/LL. 1.0 = session tarča mora biti vsaj toliko daleč kot SL.", group = groupTgt)
+useRunSess = input.bool(true, "Upoštevaj tudi tekoči session", tooltip = "Če je entry med sessionom (npr. NY AM), šteje kot tarča tudi high/low tega sessiona do trenutka entryja.", group = groupTgt)
+
+// ── Trailing SL ──
+groupTrail = "Trailing SL (HL / LH)"
+useTrail = input.bool(true, "Vklopi trailing SL", tooltip = "Long: ko se po entryju naredi higher low (1m pivot low nad trenutnim SL), gre SL tja. Short: zrcalno z lower high.", group = groupTrail)
+trailPivLen = input.int(21, "HL / LH pivot dolžina", minval = 2, tooltip = "Enako kot HH/LL (LuxAlgo 21). HL = swing low, višji od prejšnjega swing lowa. LH = swing high, nižji od prejšnjega. Pivot je potrjen šele po toliko svečah.", group = groupTrail)
+trailBuffer = input.float(0.0, "Odmik od HL / LH ($)", minval = 0.0, step = 0.5, tooltip = "SL gre toliko pod HL (long) oz. nad LH (short).", group = groupTrail)
+trailStartR = input.float(0.0, "Trail šele po X R profita", minval = 0.0, step = 0.5, tooltip = "0 = trail od entryja naprej. 1.0 = SL se začne premikati šele, ko je bila cena vsaj 1R v profitu.", group = groupTrail)
+showTrailLine = input.bool(true, "Prikaži SL črto med tradeom", group = groupTrail)
+trailLineColor = input.color(color.new(color.fuchsia, 0), "Barva trail SL", group = groupTrail)
+
+// ── Strategy statistika ──
+groupStats = "Strategy statistika"
+showStats = input.bool(true, "Prikaži statistiko TP / SL / BE", group = groupStats)
+statsPos = input.string("Top right", "Pozicija", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = groupStats)
+
+// ── NY sweep filter ──
+groupNY = "Filter: NY sweep London / Asia"
+useNYFilter = input.bool(true, "Vklopi NY sweep filter", tooltip = "Od konca Londona naprej se spremlja London high/low. Pobran London low -> v NY samo LONG. Pobran London high -> v NY samo SHORT. Dokler ni pobrano nič, sta dovoljeni obe smeri. Velja zadnji sweep. Filter se resetira vsak dan ob koncu Londona.", group = groupNY)
+nyTrackWindow = input.session("1200-1800", "Spremljanje sweepa (od konca Londona)", tooltip = "V tem času se išče sweep London high/low. Privzeto od 12:00 (konec Londona) do konca NY AM.", group = groupNY)
+nyWindow = input.session("1530-1800", "Kje filter velja (NY AM)", tooltip = "Samo v tem oknu filter omeji smer setupov.", group = groupNY)
+showNYBias = input.bool(true, "Označi sweep na grafu", group = groupNY)
+
+// ── Asia sweep filter (London) ──
+groupAsiaF = "Filter: London sweep Asia"
+useAsiaFilter = input.bool(true, "Vklopi Asia sweep filter", tooltip = "Po koncu Asie: ko cena pobere Asia high -> samo SHORT. Ko pobere Asia low -> samo LONG. Velja zadnji sweep. Dokler ni pobrano nič, sta dovoljeni obe smeri. Velja samo znotraj okna spodaj.", group = groupAsiaF)
+asiaFiltWindow = input.session("0700-1200", "Okno filtra (konec Asie - konec Londona)", group = groupAsiaF)
+showAsiaBias = input.bool(true, "Označi sweep na grafu", group = groupAsiaF)
+
+// ── NWOG filter ──
+groupNWOG = "Filter: NWOG (New Week Opening Gap)"
+useNWOG = input.bool(true, "Vklopi NWOG filter", tooltip = "Gap med zadnjo ceno petka in odprtjem ponedeljka. Dokler se cena po odprtju tedna ne dotakne gapa, so short RB-ji in short vstopi blokirani. Po dotiku sta spet dovoljeni obe smeri. Gap ni treba zapolniti - dovolj je dotik.", group = groupNWOG)
+nwogMode = input.string("Samo short", "Kaj blokira", options = ["Samo short", "Po smeri gapa"], tooltip = "Samo short = vedno blokira short do dotika. Po smeri gapa = gap NAD ceno (gap down) blokira short, gap POD ceno (gap up) blokira long.", group = groupNWOG)
+nwogMinGap = input.float(0.0, "Min. velikost gapa ($)", minval = 0.0, step = 0.5, tooltip = "Manjši gapi se ignorirajo (filter ta teden ne velja).", group = groupNWOG)
+nwogIgnoreMin = input.int(15, "Ne štej dotika prvih X minut", minval = 0, tooltip = "Dotik gapa v prvih X minutah po odprtju tedna se ne upošteva - blokada ostane aktivna.", group = groupNWOG)
+showNWOG = input.bool(true, "Prikaži NWOG", group = groupNWOG)
+nwogColor = input.color(color.new(color.yellow, 85), "Barva NWOG", group = groupNWOG)
+
+// ── Alerts ──
+groupAlert = "Alerts"
+alertOnRB    = input.bool(true, "Alert on new rejection blocks", tooltip = "Sproži se takoj, ko se RB nariše (ob zaprtju 15m sveče), brez čakanja na zaprtje 1-minutne sveče.", group = groupAlert)
+alertOnEntry = input.bool(true, "Alert on entries", group = groupAlert)
+alertEveryTick = input.bool(false, "Dovoli več sprožitev znotraj iste sveče", tooltip = "Izklopljeno (priporočeno) = en alert na svečo, sproži se ob prvem ticku. Vklopljeno = alert se lahko ponovi ob vsakem ticku iste sveče.", group = groupAlert)
+
+// Frekvenca za alert() klice. freq_once_per_bar se v realnem času sproži
+// ŽE OB PRVEM TICKU nove sveče - torej takoj, ko RB nastane.
+alertFreq = alertEveryTick ? alert.freq_all : alert.freq_once_per_bar
+
+// Vsak setup je ocenjen kot A.
+SETUP_GRADE = "A"
+
+
+// ══════════════════════════════════════════════════════════════════════
+// HTF FVG DETECTION
+// ══════════════════════════════════════════════════════════════════════
+
+f_detectHTFFVG(simple string tf) =>
+    [h0, l0, c0, h2, l2, t2] = request.security(
+         syminfo.tickerid,
+         tf,
+         [high[1], low[1], close[1], high[3], low[3], time[2]],
+         lookahead = barmerge.lookahead_on
+     )
+
+    bool bull = not na(l0) and not na(h2) and l0 > h2
+    bool bear = not na(h0) and not na(l2) and h0 < l2
+
+    float bullTop = bull ? l0 : na
+    float bullBot = bull ? h2 : na
+    float bearTop = bear ? l2 : na
+    float bearBot = bear ? h0 : na
+
+    [bullTop, bullBot, bearTop, bearBot, t2, c0]
+
+
+// ══════════════════════════════════════════════════════════════════════
+// FVG STORAGE
+// ══════════════════════════════════════════════════════════════════════
+
+var float[] fvgTop        = array.new_float()
+var float[] fvgBot        = array.new_float()
+var int[]   fvgOriginTime = array.new_int()
+var string[] fvgTF        = array.new_string()
+var bool[]  fvgBull       = array.new_bool()
+
+f_addFVG(float top, float bot, int originTime, string tfLabel, bool isBull) =>
+    if not na(top) and not na(bot) and (top - bot) >= minFVG
+        bool exists = false
+        if array.size(fvgTop) > 0
+            for i = 0 to array.size(fvgTop) - 1
+                if array.get(fvgTF, i) == tfLabel and
+                   array.get(fvgBull, i) == isBull and
+                   math.abs(array.get(fvgTop, i) - top) < syminfo.mintick * 2 and
+                   math.abs(array.get(fvgBot, i) - bot) < syminfo.mintick * 2
+                    exists := true
+                    break
+        if not exists
+            array.push(fvgTop, top)
+            array.push(fvgBot, bot)
+            array.push(fvgOriginTime, originTime)
+            array.push(fvgTF, tfLabel)
+            array.push(fvgBull, isBull)
+
+
+[bullTop15, bullBot15, bearTop15, bearBot15, t15, close15] = f_detectHTFFVG("15")
+[bullTop60, bullBot60, bearTop60, bearBot60, t60, close60] = f_detectHTFFVG("60")
+[bullTop240, bullBot240, bearTop240, bearBot240, t240, close240] = f_detectHTFFVG("240")
+[bullTopD, bullBotD, bearTopD, bearBotD, tD, closeD] = f_detectHTFFVG("D")
+
+if useTF15
+    if not na(bullTop15)
+        f_addFVG(bullTop15, bullBot15, t15, "15m", true)
+    if not na(bearTop15)
+        f_addFVG(bearTop15, bearBot15, t15, "15m", false)
+
+if useTF60
+    if not na(bullTop60)
+        f_addFVG(bullTop60, bullBot60, t60, "1h", true)
+    if not na(bearTop60)
+        f_addFVG(bearTop60, bearBot60, t60, "1h", false)
+
+if useTF240
+    if not na(bullTop240)
+        f_addFVG(bullTop240, bullBot240, t240, "4h", true)
+    if not na(bearTop240)
+        f_addFVG(bearTop240, bearBot240, t240, "4h", false)
+
+if useTFD
+    if not na(bullTopD)
+        f_addFVG(bullTopD, bullBotD, tD, "1D", true)
+    if not na(bearTopD)
+        f_addFVG(bearTopD, bearBotD, tD, "1D", false)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// REMOVE MITIGATED FVGs (close-through on the FVG's own timeframe)
+// ══════════════════════════════════════════════════════════════════════
+
+f_getTFClose(string tf) =>
+    tf == "15m" ? close15 : tf == "1h" ? close60 : tf == "4h" ? close240 : closeD
+
+if array.size(fvgTop) > 0
+    int idx = array.size(fvgTop) - 1
+    while idx >= 0
+        bool isBull = array.get(fvgBull, idx)
+        float top = array.get(fvgTop, idx)
+        float bot = array.get(fvgBot, idx)
+        float tfClose = f_getTFClose(array.get(fvgTF, idx))
+        bool mitigated = not na(tfClose) and ((isBull and tfClose < bot) or (not isBull and tfClose > top))
+        if mitigated
+            array.remove(fvgTop, idx)
+            array.remove(fvgBot, idx)
+            array.remove(fvgOriginTime, idx)
+            array.remove(fvgTF, idx)
+            array.remove(fvgBull, idx)
+        idx -= 1
+
+// Cap per timeframe. Eviction is by PRICE DISTANCE from the current close,
+// not by age - an old FVG sitting right at price is still tradeable, while a
+// fresh one 2000 points away is not.
+f_fvgDistance(int i) =>
+    float top = array.get(fvgTop, i)
+    float bot = array.get(fvgBot, i)
+    close > top ? close - top : close < bot ? bot - close : 0.0
+
+f_capTF(string tfLabel, int maxKeep) =>
+    int cnt = 0
+    if array.size(fvgTop) > 0
+        for i = 0 to array.size(fvgTop) - 1
+            if array.get(fvgTF, i) == tfLabel
+                cnt += 1
+    while cnt > maxKeep
+        int worstIdx = -1
+        float worstDist = -1.0
+        for i = 0 to array.size(fvgTop) - 1
+            if array.get(fvgTF, i) == tfLabel
+                float d = f_fvgDistance(i)
+                if d > worstDist
+                    worstDist := d
+                    worstIdx := i
+        if worstIdx >= 0
+            array.remove(fvgTop, worstIdx)
+            array.remove(fvgBot, worstIdx)
+            array.remove(fvgOriginTime, worstIdx)
+            array.remove(fvgTF, worstIdx)
+            array.remove(fvgBull, worstIdx)
+        cnt -= 1
+
+f_capTF("15m", 30)
+f_capTF("1h", 20)
+f_capTF("4h", 15)
+f_capTF("1D", 15)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// 1-MINUTE LIQUIDITY AND 15-MINUTE REJECTION BLOCKS
+// ══════════════════════════════════════════════════════════════════════
+
+var float[] liqHighs = array.new_float()
+var int[] liqHighTimes = array.new_int()
+var float[] liqLows = array.new_float()
+var int[] liqLowTimes = array.new_int()
+
+var float[] sweptHighLevels = array.new_float()
+var int[] sweptHighPivotTimes = array.new_int()
+var int[] sweptHighTimes = array.new_int()
+var float[] sweptLowLevels = array.new_float()
+var int[] sweptLowPivotTimes = array.new_int()
+var int[] sweptLowTimes = array.new_int()
+
+float liqPivotHigh = ta.pivothigh(pivotLenLiq, pivotLenLiq)
+float liqPivotLow = ta.pivotlow(pivotLenLiq, pivotLenLiq)
+
+if not na(liqPivotHigh)
+    array.push(liqHighs, liqPivotHigh)
+    array.push(liqHighTimes, time[pivotLenLiq])
+
+if not na(liqPivotLow)
+    array.push(liqLows, liqPivotLow)
+    array.push(liqLowTimes, time[pivotLenLiq])
+
+if array.size(liqHighs) > 0
+    int highIdx = array.size(liqHighs) - 1
+    while highIdx >= 0
+        float liquidityHigh = array.get(liqHighs, highIdx)
+        if high >= liquidityHigh
+            array.push(sweptHighLevels, liquidityHigh)
+            array.push(sweptHighPivotTimes, array.get(liqHighTimes, highIdx))
+            array.push(sweptHighTimes, time)
+            array.remove(liqHighs, highIdx)
+            array.remove(liqHighTimes, highIdx)
+        highIdx -= 1
+
+if array.size(liqLows) > 0
+    int lowIdx = array.size(liqLows) - 1
+    while lowIdx >= 0
+        float liquidityLow = array.get(liqLows, lowIdx)
+        if low <= liquidityLow
+            array.push(sweptLowLevels, liquidityLow)
+            array.push(sweptLowPivotTimes, array.get(liqLowTimes, lowIdx))
+            array.push(sweptLowTimes, time)
+            array.remove(liqLows, lowIdx)
+            array.remove(liqLowTimes, lowIdx)
+        lowIdx -= 1
+
+
+// ══════════════════════════════════════════════════════════════════════
+// HH / LL (LuxAlgo logika) - tarče za TP
+// HH = swing high višji od prejšnjega swing higha. Hranimo samo še
+// nepobrane ravni.
+// ══════════════════════════════════════════════════════════════════════
+
+var float[] hhLevels = array.new_float()
+var float[] llLevels = array.new_float()
+var float lastSwingHigh = na
+var float lastSwingLow = na
+
+float swingPH = ta.pivothigh(hhLen, hhLen)
+float swingPL = ta.pivotlow(hhLen, hhLen)
+
+if not na(swingPH)
+    if not na(lastSwingHigh) and swingPH > lastSwingHigh
+        array.push(hhLevels, swingPH)
+    lastSwingHigh := swingPH
+
+if not na(swingPL)
+    if not na(lastSwingLow) and swingPL < lastSwingLow
+        array.push(llLevels, swingPL)
+    lastSwingLow := swingPL
+
+if array.size(hhLevels) > 0
+    int hi = array.size(hhLevels) - 1
+    while hi >= 0
+        if high > array.get(hhLevels, hi)
+            array.remove(hhLevels, hi)
+        hi -= 1
+
+if array.size(llLevels) > 0
+    int li = array.size(llLevels) - 1
+    while li >= 0
+        if low < array.get(llLevels, li)
+            array.remove(llLevels, li)
+        li -= 1
+
+while array.size(hhLevels) > 50
+    array.shift(hhLevels)
+while array.size(llLevels) > 50
+    array.shift(llLevels)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// SESSION HIGH / LOW (Asia, London, NY AM, NY PM)
+// Ko se session konča, se shrani njegov high/low. Raven je "živa",
+// dokler je cena ne pobere.
+// ══════════════════════════════════════════════════════════════════════
+
+f_trackSession(simple string sessStr, string name) =>
+    bool inS = not na(time(timeframe.period, sessStr, sessTZ))
+    var float runHi  = na
+    var float runLo  = na
+    var int   startT = na
+    var float doneHi = na
+    var float doneLo = na
+    var bool  hiLive = false
+    var bool  loLive = false
+    var line  hiLn   = na
+    var line  loLn   = na
+
+    // Podaljšaj črte in preveri, ali je cena pobrala raven
+    if hiLive
+        if not na(hiLn)
+            line.set_x2(hiLn, time)
+        if high > doneHi
+            hiLive := false
+    if loLive
+        if not na(loLn)
+            line.set_x2(loLn, time)
+        if low < doneLo
+            loLive := false
+
+    if inS and not inS[1]
+        runHi  := high
+        runLo  := low
+        startT := time
+    else if inS
+        runHi := math.max(runHi, high)
+        runLo := math.min(runLo, low)
+
+    // Session se je pravkar končal
+    if not inS and inS[1] and not na(runHi)
+        doneHi := runHi
+        doneLo := runLo
+        hiLive := true
+        loLive := true
+        hiLn := na
+        loLn := na
+        if showSessLevels
+            hiLn := line.new(x1 = startT, y1 = doneHi, x2 = time, y2 = doneHi, xloc = xloc.bar_time, color = sessLvlColor, style = line.style_dotted, width = 1)
+            loLn := line.new(x1 = startT, y1 = doneLo, x2 = time, y2 = doneLo, xloc = xloc.bar_time, color = sessLvlColor, style = line.style_dotted, width = 1)
+            label.new(x = startT, y = doneHi, text = name + " H", xloc = xloc.bar_time, style = label.style_label_lower_left, color = #00000000, textcolor = sessLvlColor, size = size.tiny)
+            label.new(x = startT, y = doneLo, text = name + " L", xloc = xloc.bar_time, style = label.style_label_upper_left, color = #00000000, textcolor = sessLvlColor, size = size.tiny)
+
+    [doneHi, doneLo, hiLive, loLive, inS ? runHi : na, inS ? runLo : na]
+
+[asiaHi,   asiaLo,   asiaHiLive,   asiaLoLive,   asiaRunHi,   asiaRunLo]   = f_trackSession(asiaSess,   "Asia")
+[londonHi, londonLo, londonHiLive, londonLoLive, londonRunHi, londonRunLo] = f_trackSession(londonSess, "London")
+[nyamHi,   nyamLo,   nyamHiLive,   nyamLoLive,   nyamRunHi,   nyamRunLo]   = f_trackSession(nyamSess,   "NY AM")
+[nypmHi,   nypmLo,   nypmHiLive,   nypmLoLive,   nypmRunHi,   nypmRunLo]   = f_trackSession(nypmSess,   "NY PM")
+
+
+// ══════════════════════════════════════════════════════════════════════
+// NWOG - NEW WEEK OPENING GAP
+// Gap = med close zadnje sveče prejšnjega tedna in open prve sveče
+// novega tedna. Dokler se cena gapa ne dotakne, je blokada aktivna
+// (privzeto: brez shortov). Ob prvem dotiku se blokada sprosti za
+// preostanek tedna. Zapolnitev gapa ni potrebna.
+// ══════════════════════════════════════════════════════════════════════
+
+bool newWeek = timeframe.change("W")
+var float nwogTop     = na
+var float nwogBot     = na
+var bool  nwogUp      = false   // true = gap up (gap pod ceno)
+var bool  nwogPending = false   // true = gap še ni bil dotaknjen
+var box   nwogBox     = na
+var int   nwogStartT  = na      // čas nastanka gapa
+
+if newWeek
+    nwogPending := false
+    float prevC = close[1]
+    if not na(prevC)
+        float gTop = math.max(open, prevC)
+        float gBot = math.min(open, prevC)
+        if gTop - gBot > 0 and gTop - gBot >= nwogMinGap
+            nwogTop := gTop
+            nwogBot := gBot
+            nwogUp  := open > prevC
+            // Dotik v prvih nwogIgnoreMin minutah se ne šteje, zato je
+            // blokada ob nastanku gapa vedno aktivna.
+            nwogPending := true
+            nwogStartT  := time
+            nwogBox := na
+            if showNWOG
+                nwogBox := box.new(left = time, top = gTop, right = time, bottom = gBot, xloc = xloc.bar_time,
+                     border_color = color.new(nwogColor, 40), bgcolor = nwogColor,
+                     text = "NWOG", text_size = size.tiny, text_color = color.gray, text_halign = text.align_left)
+else if nwogPending
+    if not na(nwogBox)
+        box.set_right(nwogBox, time)
+    bool pastIgnore = time >= nwogStartT + nwogIgnoreMin * 60 * 1000
+    if pastIgnore and high >= nwogBot and low <= nwogTop
+        nwogPending := false
+        if showNWOG
+            label.new(x = time, y = nwogUp ? nwogTop : nwogBot, text = "NWOG dotaknjen", xloc = xloc.bar_time,
+                 style = nwogUp ? label.style_label_down : label.style_label_up,
+                 color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
+f_nwogAllowed(bool isBull) =>
+    bool blocked = useNWOG and nwogPending and (nwogMode == "Samo short" ? not isBull : (nwogUp ? isBull : not isBull))
+    not blocked
+
+
+// ══════════════════════════════════════════════════════════════════════
+// NY SWEEP FILTER
+// Ob začetku NY okna se zapomnita London high/low (samo še nepobrana).
+// NY pobere London low  -> samo LONG.
+// NY pobere London high -> samo SHORT.
+// Dokler NY ne pobere ničesar -> obe smeri. Velja zadnji sweep.
+// Izven NY okna filter ne velja.
+// ══════════════════════════════════════════════════════════════════════
+
+bool inNYTrack = not na(time(timeframe.period, nyTrackWindow, sessTZ))
+bool inNY      = not na(time(timeframe.period, nyWindow, sessTZ))
+var int   nyBias  = 0      // 0 = obe smeri, 1 = samo long, -1 = samo short
+var float nyLonHi = na
+var float nyLonLo = na
+
+// Ob koncu Londona (12:00) se zapomnita London high/low
+if inNYTrack and not inNYTrack[1]
+    nyBias  := 0
+    nyLonHi := londonHiLive ? londonHi : na
+    nyLonLo := londonLoLive ? londonLo : na
+
+if inNYTrack
+    if not na(nyLonLo) and low < nyLonLo
+        nyBias := 1
+        if showNYBias
+            label.new(x = time, y = nyLonLo, text = "London L pobran → NY samo LONG", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(color.green, 70), textcolor = color.white, size = size.tiny)
+        nyLonLo := na
+    if not na(nyLonHi) and high > nyLonHi
+        nyBias := -1
+        if showNYBias
+            label.new(x = time, y = nyLonHi, text = "London H pobran → NY samo SHORT", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+        nyLonHi := na
+else
+    nyBias := 0
+
+// ══════════════════════════════════════════════════════════════════════
+// ASIA SWEEP FILTER (London)
+// Ob koncu Asie se zapomnita Asia high/low.
+// Cena pobere Asia high -> samo SHORT.
+// Cena pobere Asia low  -> samo LONG.
+// Dokler ni pobrano nič -> obe smeri. Velja zadnji sweep.
+// Izven okna (privzeto 07:00-12:00) filter ne velja.
+// ══════════════════════════════════════════════════════════════════════
+
+bool inAsiaF = not na(time(timeframe.period, asiaFiltWindow, sessTZ))
+var int   asiaBias = 0      // 0 = obe smeri, 1 = samo long, -1 = samo short
+var float afHi     = na
+var float afLo     = na
+
+if inAsiaF and not inAsiaF[1]
+    asiaBias := 0
+    afHi := asiaHiLive ? asiaHi : na
+    afLo := asiaLoLive ? asiaLo : na
+
+if inAsiaF
+    if not na(afHi) and high > afHi
+        asiaBias := -1
+        if showAsiaBias
+            label.new(x = time, y = afHi, text = "Asia H pobran → samo SHORT", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+        afHi := na
+    if not na(afLo) and low < afLo
+        asiaBias := 1
+        if showAsiaBias
+            label.new(x = time, y = afLo, text = "Asia L pobran → samo LONG", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(color.green, 70), textcolor = color.white, size = size.tiny)
+        afLo := na
+else
+    asiaBias := 0
+
+// Skupni filter smeri: Asia sweep + NY sweep + NWOG
+f_dirAllowed(bool isBull) =>
+    bool asiaOk = not useAsiaFilter or asiaBias == 0 or (isBull ? asiaBias == 1 : asiaBias == -1)
+    bool nyOk   = not useNYFilter or not inNY or nyBias == 0 or (isBull ? nyBias == 1 : nyBias == -1)
+    asiaOk and nyOk and f_nwogAllowed(isBull)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// TP / BE IZRAČUN
+// Long:  TP = prvi HH nad entryjem. Če je vmes nepobran session high,
+//        je TP na session highu.
+// BE se ne računa ob entryju - glej sekcijo SLEDENJE TRADE-OV.
+// Short: zrcalno (LL, session low, 1m pivot low).
+// ══════════════════════════════════════════════════════════════════════
+
+f_nearestLevel(float[] levels, bool above, float px) =>
+    float best = na
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            float v = array.get(levels, i)
+            bool ok = above ? v > px : v < px
+            if ok and (na(best) or (above ? v < best : v > best))
+                best := v
+    best
+
+f_sessTarget(bool isBull, float px) =>
+    // 4 končani sessioni (samo nepobrani) + tekoči session (high/low do zdaj)
+    float[] lv = array.from(
+         isBull ? asiaHi : asiaLo, isBull ? londonHi : londonLo, isBull ? nyamHi : nyamLo, isBull ? nypmHi : nypmLo,
+         isBull ? asiaRunHi : asiaRunLo, isBull ? londonRunHi : londonRunLo, isBull ? nyamRunHi : nyamRunLo, isBull ? nypmRunHi : nypmRunLo)
+    bool[] live = array.from(
+         isBull ? asiaHiLive : asiaLoLive, isBull ? londonHiLive : londonLoLive, isBull ? nyamHiLive : nyamLoLive, isBull ? nypmHiLive : nypmLoLive,
+         useRunSess, useRunSess, useRunSess, useRunSess)
+    string[] names = array.from("Asia", "London", "NY AM", "NY PM", "Asia (tekoči)", "London (tekoči)", "NY AM (tekoči)", "NY PM (tekoči)")
+    float  best = na
+    string nm   = ""
+    for i = 0 to 7
+        float v = array.get(lv, i)
+        if array.get(live, i) and not na(v)
+            bool ok = isBull ? v > px : v < px
+            if ok and (na(best) or (isBull ? v < best : v > best))
+                best := v
+                nm := array.get(names, i) + (isBull ? " high" : " low")
+    [best, nm]
+
+f_targets(bool isBull, float entryPx, float stopPts) =>
+    float swingT = isBull ? f_nearestLevel(hhLevels, true, entryPx) : f_nearestLevel(llLevels, false, entryPx)
+    [sessT, sessNm] = f_sessTarget(isBull, entryPx)
+    // Session tarča velja samo, če je nagrada vsaj minSessRR x risk
+    bool sessOk = useSessTP and not na(sessT) and math.abs(sessT - entryPx) >= stopPts * minSessRR
+    float  tp  = na
+    string src = ""
+    if not na(swingT)
+        tp  := swingT
+        src := isBull ? "HH" : "LL"
+        if sessOk and (isBull ? sessT < swingT : sessT > swingT)
+            tp  := sessT
+            src := sessNm
+    else if sessOk
+        tp  := sessT
+        src := sessNm
+    else
+        tp  := isBull ? entryPx + stopPts * tpRR : entryPx - stopPts * tpRR
+        src := str.tostring(tpRR) + "R (ni tarče)"
+    [tp, src]
+
+// STRATEGY: RB se potrdi že ob zaprtju ZADNJE 1m sveče 15m sveče B
+// (npr. 15:59), ne šele ob odprtju naslednje (16:00). Takrat je sveča B
+// že v celoti zaključena, zato lahko limit order čaka že na sveči 16:00.
+// Candle B = [0], candle A = [1], candle before A = [2].
+// Vrednosti se uporabijo SAMO na zadnji 1m sveči 15m sveče -> brez pogleda v prihodnost.
+[rbOpen1, rbHigh1, rbLow1, rbClose1, rbTime1,
+ rbOpen2, rbHigh2, rbLow2, rbClose2, rbTime2, rbCurrentTime,
+ rbOpen3, rbHigh3, rbLow3, rbClose3] = request.security(
+     syminfo.tickerid,
+     "15",
+     [open, high, low, close, time, open[1], high[1], low[1], close[1], time[1], time_close,
+      open[2], high[2], low[2], close[2]],
+     lookahead = barmerge.lookahead_on
+ )
+
+// Zadnja 1m sveča znotraj 15m sveče
+bool new15mCandle = not na(rbCurrentTime) and time_close == rbCurrentTime
+
+bool rawBullPattern = rbClose2 < rbOpen2 and rbClose1 > rbOpen1
+bool rawBearPattern = rbClose2 > rbOpen2 and rbClose1 < rbOpen1
+
+f_upperWick(float o, float h, float c) => h - math.max(o, c)
+f_lowerWick(float o, float l, float c) => math.min(o, c) - l
+
+f_sizeBy(float o, float h, float l, float c, string mode, bool isBearPattern) =>
+    mode == "Body" ? math.abs(c - o) :
+     mode == "Full range" ? h - l :
+     isBearPattern ? f_upperWick(o, h, c) : f_lowerWick(o, l, c)
+
+f_candleSize(float o, float h, float l, float c, bool isBearPattern) =>
+    f_sizeBy(o, h, l, c, sizeMode, isBearPattern)
+
+float sizeA = f_candleSize(rbOpen2, rbHigh2, rbLow2, rbClose2, rawBearPattern)
+float sizeB = f_candleSize(rbOpen1, rbHigh1, rbLow1, rbClose1, rawBearPattern)
+float sizeZ = f_sizeBy(rbOpen3, rbHigh3, rbLow3, rbClose3, standaloneMode, rawBearPattern)
+float sizeBstand = f_sizeBy(rbOpen1, rbHigh1, rbLow1, rbClose1, standaloneMode, rawBearPattern)
+
+bool sizeRaw = not na(sizeA) and not na(sizeB) and sizeB >= sizeA * minSizeRatio
+bool beyondExtreme = rawBearPattern ? (not na(rbHigh3) and rbHigh1 > rbHigh3) : (not na(rbLow3) and rbLow1 < rbLow3)
+bool standaloneSizeOk = not na(sizeZ) and not na(sizeBstand) and sizeBstand >= sizeZ * standaloneRatio
+bool standRaw = standaloneMode == "Beyond previous extreme" ? beyondExtreme : standaloneSizeOk
+
+bool sizeOk = not reqBBigger or sizeRaw
+bool standaloneOk = not reqStandalone or standRaw
+
+// Session filter - Europe/Ljubljana handles CET/CEST (summer time) automatically.
+bool inSession = not useSession or not na(time(timeframe.period, sessWindow, sessTZ))
+
+// Session za nastanek RB-ja se preveri na času, ko se 15m sveča zapre
+// (npr. RB iz sveč 08:30 + 08:45 se potrdi ob 08:59:59 -> šteje kot 09:00).
+f_inSessAt(int t) =>
+    int m  = hour(t, sessTZ) * 60 + minute(t, sessTZ)
+    int sM = int(str.tonumber(str.substring(sessWindow, 0, 2))) * 60 + int(str.tonumber(str.substring(sessWindow, 2, 4)))
+    int eM = int(str.tonumber(str.substring(sessWindow, 5, 7))) * 60 + int(str.tonumber(str.substring(sessWindow, 7, 9)))
+    sM <= eM ? (m >= sM and m < eM) : (m >= sM or m < eM)
+
+bool inSessionRB = not useSession or f_inSessAt(time_close)
+
+// Ali je čas t znotraj okna "HHMM-HHMM" (v sessTZ)
+f_inWindowAt(int t, string w) =>
+    int m  = hour(t, sessTZ) * 60 + minute(t, sessTZ)
+    int sM = int(str.tonumber(str.substring(w, 0, 2))) * 60 + int(str.tonumber(str.substring(w, 2, 4)))
+    int eM = int(str.tonumber(str.substring(w, 5, 7))) * 60 + int(str.tonumber(str.substring(w, 7, 9)))
+    sM <= eM ? (m >= sM and m < eM) : (m >= sM or m < eM)
+
+// Blackout: trenutna sveča (za entry krog) in naslednja sveča (za limit order,
+// ki se postavi ob zaprtju in izvede na naslednji sveči)
+bool blackoutNow  = useBlackout and f_inWindowAt(time, blackoutWindow)
+bool blackoutNext = useBlackout and f_inWindowAt(time_close, blackoutWindow)
+
+bool bullishRB = new15mCandle and inSessionRB and sizeOk and standaloneOk and rawBullPattern and f_dirAllowed(true)
+bool bearishRB = new15mCandle and inSessionRB and sizeOk and standaloneOk and rawBearPattern and f_dirAllowed(false)
+
+bool rawPattern = new15mCandle and (rawBullPattern or rawBearPattern)
+if showSizeDebug and rawPattern and not na(sizeA) and not na(sizeB) and sizeA > 0
+    bool allOk = sizeOk and standaloneOk
+    label.new(x = time, y = math.max(rbHigh1, rbHigh2), xloc = xloc.bar_time, style = label.style_label_down, color = allOk ? color.new(color.teal, 20) : color.new(color.maroon, 20), textcolor = color.white, size = size.tiny,
+     text = "A " + str.tostring(sizeA, "#.##") + "  B " + str.tostring(sizeB, "#.##") + "  B/A " + str.tostring(sizeB / sizeA, "#.##") + (sizeOk ? " OK" : " FAIL") +
+       "\n" + (standaloneMode == "Beyond previous extreme" ?
+         (rawBearPattern ? "B high " + str.tostring(rbHigh1, format.mintick) + "  prev high " + str.tostring(rbHigh3, format.mintick)
+                         : "B low " + str.tostring(rbLow1, format.mintick) + "  prev low " + str.tostring(rbLow3, format.mintick)) :
+         "B " + str.tostring(sizeBstand, "#.##") + "  prev " + str.tostring(sizeZ, "#.##")) +
+       "  " + (standaloneOk ? "OK" : "FAIL"))
+
+f_findSweep(bool isLowSweep, int windowStart, int windowEnd, float minLevel, float maxLevel) =>
+    bool found = false
+    float foundLevel = na
+    int foundPivotTime = na
+    int foundSweepTime = na
+    int eventCount = isLowSweep ? array.size(sweptLowLevels) : array.size(sweptHighLevels)
+
+    if eventCount > 0 and not na(windowStart) and not na(windowEnd)
+        int eventIdx = eventCount - 1
+        while eventIdx >= 0
+            int eventTime = isLowSweep ? array.get(sweptLowTimes, eventIdx) : array.get(sweptHighTimes, eventIdx)
+            float eventLevel = isLowSweep ? array.get(sweptLowLevels, eventIdx) : array.get(sweptHighLevels, eventIdx)
+            bool levelOk = (na(minLevel) or eventLevel >= minLevel) and (na(maxLevel) or eventLevel <= maxLevel)
+            if eventTime >= windowStart and eventTime < windowEnd and levelOk
+                found := true
+                foundLevel := eventLevel
+                foundPivotTime := isLowSweep ? array.get(sweptLowPivotTimes, eventIdx) : array.get(sweptHighPivotTimes, eventIdx)
+                foundSweepTime := eventTime
+                break
+            eventIdx -= 1
+
+    [found, foundLevel, foundPivotTime, foundSweepTime]
+
+var box[] rbBoxes = array.new_box()
+var line[] rbSweepLines = array.new_line()
+
+f_addRB(float top, float bottom, int leftTime, int rightTime, color rbColor) =>
+    box rbBox = na
+    if top > bottom
+        rbBox := box.new(left = leftTime, top = top, right = rightTime, bottom = bottom, xloc = xloc.bar_time, border_color = color.new(rbColor, 25), bgcolor = color.new(rbColor, rbTransparency))
+        array.push(rbBoxes, rbBox)
+        while array.size(rbBoxes) > maxRBInput
+            box oldBox = array.shift(rbBoxes)
+            box.delete(oldBox)
+    rbBox
+
+f_addSweepLine(float level, int pivotTime, int sweepTime, color sweepColor) =>
+    if not na(level) and not na(pivotTime) and not na(sweepTime)
+        line sweepLine = line.new(x1 = pivotTime, y1 = level, x2 = sweepTime, y2 = level, xloc = xloc.bar_time, color = sweepColor, style = line.style_dashed, width = 2)
+        array.push(rbSweepLines, sweepLine)
+        while array.size(rbSweepLines) > maxRBInput
+            line oldLine = array.shift(rbSweepLines)
+            line.delete(oldLine)
+
+// Invalidation level - the extreme of the two 15m candles.
+var line[] rbInvalLines = array.new_line()
+
+f_addInvalLine(float level, int leftTime, color invalColor) =>
+    line invalLine = na
+    if showInvalLine and not na(level) and not na(leftTime)
+        int rightTime = leftTime + invalLineBars * 15 * 60 * 1000
+        invalLine := line.new(x1 = leftTime, y1 = level, x2 = rightTime, y2 = level, xloc = xloc.bar_time, color = invalColor, style = line.style_dashed, width = invalLineWidth)
+        array.push(rbInvalLines, invalLine)
+        while array.size(rbInvalLines) > maxRBInput
+            line oldInval = array.shift(rbInvalLines)
+            line.delete(oldInval)
+    invalLine
+
+
+// ══════════════════════════════════════════════════════════════════════
+// RB HTF FVG DELIVERY / DAILY BIAS
+// ══════════════════════════════════════════════════════════════════════
+
+f_tfDeliveryEnabled(string tf) =>
+    (tf == "15m" and useDeliv15) or (tf == "1h" and useDeliv60) or (tf == "4h" and useDeliv240) or (tf == "1D" and useDelivD)
+
+f_checkFVGDelivery(bool isBullishRB, float aHigh, float aLow, float aClose, float bHigh, float bLow, float bClose) =>
+    bool delivered = false
+    if array.size(fvgTop) > 0
+        for i = 0 to array.size(fvgTop) - 1
+            if array.get(fvgBull, i) == isBullishRB and f_tfDeliveryEnabled(array.get(fvgTF, i))
+                float top = array.get(fvgTop, i)
+                float bot = array.get(fvgBot, i)
+                bool aTouches = aHigh >= bot and aLow <= top
+                bool bTouches = bHigh >= bot and bLow <= top
+                bool aDestroys = isBullishRB ? aClose < bot : aClose > top
+                bool bDestroys = isBullishRB ? bClose < bot : bClose > top
+                if (aTouches or bTouches) and not aDestroys and not bDestroys
+                    delivered := true
+                    break
+    delivered
+
+f_opposingDailyFVG(bool isBullishRB, float zoneTop, float zoneBot) =>
+    bool blocked = false
+    if array.size(fvgTop) > 0
+        for i = 0 to array.size(fvgTop) - 1
+            if array.get(fvgTF, i) == "1D" and array.get(fvgBull, i) != isBullishRB
+                float top = array.get(fvgTop, i)
+                float bot = array.get(fvgBot, i)
+                if zoneTop >= bot and zoneBot <= top
+                    blocked := true
+                    break
+    blocked
+
+int rbWindowStart = rbTime2
+
+
+// ══════════════════════════════════════════════════════════════════════
+// SHOOTING STAR / HAMMER NA EKSTREMU RB-ja (1m sveče znotraj A+B)
+// Poišče 1m svečo, ki naredi najvišjo (bearish) oz. najnižjo (bullish)
+// točko sveč A+B, in preveri njeno obliko po LuxAlgo pravilih.
+// Brez čakanja na pivot potrditev - rezultat je znan takoj ob nastanku RB.
+// ══════════════════════════════════════════════════════════════════════
+
+f_starAtExtreme(bool isTop, int startTime, int endTime) =>
+    int   bestI = -1
+    float bestV = na
+    if not na(startTime) and not na(endTime)
+        for i = 0 to 60
+            int t = time[i]
+            if na(t) or t < startTime
+                break
+            if t < endTime
+                float v = isTop ? high[i] : low[i]
+                if bestI < 0 or (isTop ? v > bestV : v < bestV)
+                    bestV := v
+                    bestI := i
+    bool  hit     = false
+    float lvl     = na
+    int   hitTime = na
+    if bestI >= 0
+        float o    = open[bestI]
+        float h    = high[bestI]
+        float l    = low[bestI]
+        float c    = close[bestI]
+        float body = math.abs(c - o)
+        float upW  = h - math.max(o, c)
+        float loW  = math.min(o, c) - l
+        hit := isTop ? (upW > body * starWickRatio and loW < body) : (loW > body * starWickRatio and upW < body)
+        lvl := bestV
+        hitTime := time[bestI]
+    [hit, lvl, hitTime]
+
+[bearStar, bearStarLvl, bearStarTime]       = f_starAtExtreme(true,  rbTime2, rbCurrentTime)
+[bullHammer, bullHammerLvl, bullHammerTime] = f_starAtExtreme(false, rbTime2, rbCurrentTime)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// FIB RETRACEMENT / ENTRY TRACKING
+// ══════════════════════════════════════════════════════════════════════
+
+var float[] fibZoneTop     = array.new_float()
+var float[] fibZoneBottom  = array.new_float()
+var float[] fibFixed       = array.new_float()
+var float[] fibExtreme     = array.new_float()
+var int[]   fibAnchorTime  = array.new_int()
+var bool[]  fibIsBull      = array.new_bool()
+var bool[]  fibHasExtended = array.new_bool()
+var line[]  fibLegLines    = array.new_line()
+var line[]  fib786Lines    = array.new_line()
+var box[]   fibRBBox       = array.new_box()
+var float[] fibInvalLevel  = array.new_float()
+var line[]  fibInvalLine   = array.new_line()
+
+f_fibLevel(float extreme, float fixedAnchor) =>
+    extreme + fibLevel * (fixedAnchor - extreme)
+
+// Per-bar signal state
+bool  up          = false
+bool  dn          = false
+float long_price  = na
+float long_sl     = na
+float long_TP     = na
+float short_price = na
+float short_sl    = na
+float short_TP    = na
+string entryTPSrc = ""
+float entryContracts = na
+float entryStopPts = na
+
+f_removeFibTrack(int idx, bool wasEntry) =>
+    line.delete(array.get(fibLegLines, idx))
+    line.delete(array.get(fib786Lines, idx))
+    if hideDeadRB and not wasEntry
+        box.delete(array.get(fibRBBox, idx))
+        line.delete(array.get(fibInvalLine, idx))
+    array.remove(fibZoneTop, idx)
+    array.remove(fibZoneBottom, idx)
+    array.remove(fibFixed, idx)
+    array.remove(fibExtreme, idx)
+    array.remove(fibAnchorTime, idx)
+    array.remove(fibIsBull, idx)
+    array.remove(fibHasExtended, idx)
+    array.remove(fibLegLines, idx)
+    array.remove(fib786Lines, idx)
+    array.remove(fibRBBox, idx)
+    array.remove(fibInvalLevel, idx)
+    array.remove(fibInvalLine, idx)
+
+if array.size(fibZoneTop) > 0
+    int fi = array.size(fibZoneTop) - 1
+    while fi >= 0
+        bool isBull = array.get(fibIsBull, fi)
+        float zTop = array.get(fibZoneTop, fi)
+        float zBot = array.get(fibZoneBottom, fi)
+        float fixedA = array.get(fibFixed, fi)
+        float extreme = array.get(fibExtreme, fi)
+        bool hasExtended = array.get(fibHasExtended, fi)
+        box rbBox = array.get(fibRBBox, fi)
+
+        if not na(rbBox)
+            box.set_right(rbBox, time)
+
+        bool brokenThrough = isBull ? close < zBot : close > zTop
+        float invalLvl = array.get(fibInvalLevel, fi)
+        bool invalSwept = reqInvalidation and not na(invalLvl) and (isBull ? high > invalLvl : low < invalLvl)
+        bool touches = high >= zBot and low <= zTop
+        float currentLevel = f_fibLevel(extreme, fixedA)
+        bool currentlyValid = currentLevel >= zBot and currentLevel <= zTop
+
+        if not inSession and cancelAtSessEnd
+            // Session over - pending setup expires
+            f_removeFibTrack(fi, false)
+        else if brokenThrough
+            f_removeFibTrack(fi, false)
+        else if invalSwept
+            // Ekstrem obeh 15m sveč pobran pred vstopom - setup pokvarjen
+            f_removeFibTrack(fi, false)
+        else if touches and not f_dirAllowed(isBull)
+            // NY sweep / NWOG filter ne dovoli te smeri - setup se prekliče
+            f_removeFibTrack(fi, false)
+        else if touches and currentlyValid and hasExtended and inSession and not blackoutNow
+            // ENTRY - price at the zone edge, SL at the fixed anchor, TP at tpRR
+            float entryPx = isBull ? zTop : zBot
+            float stopPts = math.abs(entryPx - fixedA)
+            float riskPerContract = stopPts * valuePerPoint
+            float contracts = riskPerContract > 0 ? math.min(riskPerTrade / riskPerContract, maxLots) : na
+            [tp, tpSrc] = f_targets(isBull, entryPx, stopPts)
+
+            if isBull
+                up := true
+                long_price := entryPx
+                long_sl := fixedA
+                long_TP := tp
+            else
+                dn := true
+                short_price := entryPx
+                short_sl := fixedA
+                short_TP := tp
+            entryTPSrc := tpSrc
+            entryContracts := contracts
+            entryStopPts := stopPts
+
+            f_removeFibTrack(fi, true)
+        else
+            bool extended = isBull ? high > extreme : low < extreme
+            if extended
+                float newExtreme = isBull ? high : low
+                float newLevel = f_fibLevel(newExtreme, fixedA)
+                bool stillValid = newLevel >= zBot and newLevel <= zTop
+                if stillValid
+                    array.set(fibExtreme, fi, newExtreme)
+                    array.set(fibHasExtended, fi, true)
+                    line.set_xy2(array.get(fibLegLines, fi), time, newExtreme)
+                    line.set_xy1(array.get(fib786Lines, fi), array.get(fibAnchorTime, fi), newLevel)
+                    line.set_xy2(array.get(fib786Lines, fi), time, newLevel)
+                else
+                    f_removeFibTrack(fi, false)
+        fi -= 1
+
+while array.size(fibZoneTop) > maxFibInput
+    f_removeFibTrack(0, false)
+
+f_pushTrack(bool isBull, float zTop, float zBot, float fixedA, float extreme, box newBox, float invalLvl, line invalLn) =>
+    array.push(fibZoneTop, zTop)
+    array.push(fibZoneBottom, zBot)
+    array.push(fibFixed, fixedA)
+    array.push(fibExtreme, extreme)
+    array.push(fibAnchorTime, rbTime2)
+    array.push(fibIsBull, isBull)
+    array.push(fibHasExtended, not reqPullback)
+    array.push(fibLegLines, line.new(x1 = rbTime2, y1 = fixedA, x2 = rbTime1, y2 = extreme, xloc = xloc.bar_time, color = fibLegColor, style = line.style_dotted, width = 1))
+    float lvl = f_fibLevel(extreme, fixedA)
+    array.push(fib786Lines, line.new(x1 = rbTime2, y1 = lvl, x2 = rbTime1, y2 = lvl, xloc = xloc.bar_time, color = fib786Color, style = line.style_dashed, width = 1))
+    array.push(fibRBBox, newBox)
+    array.push(fibInvalLevel, invalLvl)
+    array.push(fibInvalLine, invalLn)
+
+
+// ── Alert flags for new rejection blocks ──
+bool newBullRB = false
+bool newBearRB = false
+float newRBTop = na
+float newRBBot = na
+
+if showRB and bullishRB and showBullRB
+    float zTop = math.max(math.min(rbOpen2, rbClose2), math.min(rbOpen1, rbClose1))
+    float zBot = math.min(rbLow2, rbLow1)
+    [swAny, lvlAny, pvAny, tAny] = f_findSweep(true, rbWindowStart, rbCurrentTime, na, na)
+    [swIn, lvlIn, pvIn, tIn] = f_findSweep(true, rbWindowStart, rbCurrentTime, zBot - sweepTolerance, zTop + sweepTolerance)
+    bool sweepOk = reqSweepInsideRB ? swIn : reqLiqSweep ? swAny : true
+    bool hasDelivery = not reqFVGDelivery or f_checkFVGDelivery(true, rbHigh2, rbLow2, rbClose2, rbHigh1, rbLow1, rbClose1)
+    bool biasOk = not reqDailyBias or not f_opposingDailyFVG(true, zTop, zBot)
+    // Shooting star filter (bullish = hammer na dnu)
+    bool patternOk = not (filterHammerBull and bullHammer)
+    if markFiltered and sweepOk and hasDelivery and biasOk and not patternOk
+        label.new(x = bullHammerTime, y = bullHammerLvl, text = "✘", xloc = xloc.bar_time, style = label.style_label_up, color = #00000000, textcolor = color.gray, size = size.small, tooltip = "Bullish RB izločen - hammer na dnu")
+    if sweepOk and hasDelivery and biasOk and patternOk
+        newBullRB := true
+        newRBTop := zTop
+        newRBBot := zBot
+        box newBox = f_addRB(zTop, zBot, rbTime2, time, bullRBColor)
+        if swIn
+            f_addSweepLine(lvlIn, pvIn, tIn, bullRBColor)
+        else if swAny
+            f_addSweepLine(lvlAny, pvAny, tAny, bullRBColor)
+        float invalLvlBull = math.max(rbHigh2, rbHigh1)
+        line invalLnBull = f_addInvalLine(invalLvlBull, rbTime2, bullRBColor)
+        f_pushTrack(true, zTop, zBot, zBot, rbHigh1, newBox, invalLvlBull, invalLnBull)
+
+
+if showRB and bearishRB and showBearRB
+    float zTop = math.max(rbHigh2, rbHigh1)
+    float zBot = math.min(math.max(rbOpen2, rbClose2), math.max(rbOpen1, rbClose1))
+    [swAny, lvlAny, pvAny, tAny] = f_findSweep(false, rbWindowStart, rbCurrentTime, na, na)
+    [swIn, lvlIn, pvIn, tIn] = f_findSweep(false, rbWindowStart, rbCurrentTime, zBot - sweepTolerance, zTop + sweepTolerance)
+    bool sweepOk = reqSweepInsideRB ? swIn : reqLiqSweep ? swAny : true
+    bool hasDelivery = not reqFVGDelivery or f_checkFVGDelivery(false, rbHigh2, rbLow2, rbClose2, rbHigh1, rbLow1, rbClose1)
+    bool biasOk = not reqDailyBias or not f_opposingDailyFVG(false, zTop, zBot)
+    // Shooting star filter (bearish = shooting star na vrhu)
+    bool patternOk = not (filterStarBear and bearStar)
+    if markFiltered and sweepOk and hasDelivery and biasOk and not patternOk
+        label.new(x = bearStarTime, y = bearStarLvl, text = "✘", xloc = xloc.bar_time, style = label.style_label_down, color = #00000000, textcolor = color.gray, size = size.small, tooltip = "Bearish RB izločen - shooting star na vrhu")
+    if sweepOk and hasDelivery and biasOk and patternOk
+        newBearRB := true
+        newRBTop := zTop
+        newRBBot := zBot
+        box newBox = f_addRB(zTop, zBot, rbTime2, time, bearRBColor)
+        if swIn
+            f_addSweepLine(lvlIn, pvIn, tIn, bearRBColor)
+        else if swAny
+            f_addSweepLine(lvlAny, pvAny, tAny, bearRBColor)
+        float invalLvlBear = math.min(rbLow2, rbLow1)
+        line invalLnBear = f_addInvalLine(invalLvlBear, rbTime2, bearRBColor)
+        f_pushTrack(false, zTop, zBot, zTop, rbLow1, newBox, invalLvlBear, invalLnBear)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// RB ALERT - TAKOJ OB NASTANKU
+// V realnem času se alert.freq_once_per_bar sproži že ob PRVEM ticku
+// nove 1-minutne sveče, torej v isti sekundi, ko se RB pojavi na grafu.
+// ══════════════════════════════════════════════════════════════════════
+
+if alertOnRB and (newBullRB or newBearRB)
+    string rbMsg = (newBullRB ? "🟢 BULLISH RB" : "🔴 BEARISH RB") + "  " + SETUP_GRADE +
+         "\n" + syminfo.ticker + "  cena " + str.tostring(close, format.mintick) +
+         "\nCona: " + str.tostring(newRBBot, format.mintick) + " – " + str.tostring(newRBTop, format.mintick) +
+         "\nFib " + str.tostring(fibLevel) + " entry v pripravi" +
+         "\nČas: " + str.format_time(time, "HH:mm", sessTZ)
+    alert(rbMsg, alertFreq)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// STRATEGY - IZVEDBA TRADE-OV
+// Entry: limit order na robu RB cone (enako kot entry krog indikatorja).
+//        Order se postavi ob zaprtju sveče za najnovejši veljaven setup
+//        in se izvede na naslednjih svečah, ko cena pride v cono.
+// SL:    fiksna točka RB-ja.   TP: HH/LL ali session high/low.
+// BE:    ko cena po entryju pobere prvo likvidnost med entryjem in TP,
+//        gre SL na entry (izhod se označi kot "BE").
+// TRAIL: vsak nov higher low (long) / lower high (short), ki nastane po
+//        entryju, premakne SL tja. SL se premika samo v smeri tradea.
+// Hkrati je odprta največ ena pozicija.
+// ══════════════════════════════════════════════════════════════════════
+
+// Pivoti za trailing SL - morajo biti izračunani na vsaki sveči
+float trailPL   = ta.pivotlow(trailPivLen, trailPivLen)
+float trailPH   = ta.pivothigh(trailPivLen, trailPivLen)
+int   trailPivT = time[trailPivLen]
+
+// Pravi HL / LH: swing low višji od PREJŠNJEGA swing lowa (in zrcalno)
+var float trailLastPL = na
+var float trailLastPH = na
+bool isHL = not na(trailPL) and not na(trailLastPL) and trailPL > trailLastPL
+bool isLH = not na(trailPH) and not na(trailLastPH) and trailPH < trailLastPH
+if not na(trailPL)
+    trailLastPL := trailPL
+if not na(trailPH)
+    trailLastPH := trailPH
+
+var bool  posLong   = false
+var float posEntry  = na
+var float posTP     = na
+var float posSL     = na   // trenutni SL (premika ga BE in trail)
+var float posRisk   = na   // začetna razdalja entry-SL v točkah
+var bool  posBE     = false
+var bool  pendLong  = false
+var float pendEntry = na
+var float pendTP    = na
+var float pendSL    = na
+var int   posEntryT = na
+var float posExt    = na   // long: max od entryja, short: min
+var int   posProfT  = na   // zadnja sveča v profitu
+var float posAltBE  = na   // ciljna raven alternativnega BE
+
+bool  beHitLong  = false
+bool  beHitShort = false
+float beLvlLong  = na
+float beLvlShort = na
+bool  trailMoved = false
+
+// Najbližja likvidnost med entryjem in TP-jem, pobrana NA TEJ sveči
+f_sweptThisBar(bool isBull, float entryPx, float tpPx) =>
+    float best = na
+    int n = isBull ? array.size(sweptHighTimes) : array.size(sweptLowTimes)
+    if n > 0
+        int k = n - 1
+        while k >= 0
+            int  evT = isBull ? array.get(sweptHighTimes, k) : array.get(sweptLowTimes, k)
+            if evT != time
+                break
+            float v = isBull ? array.get(sweptHighLevels, k) : array.get(sweptLowLevels, k)
+            bool inRange = isBull ? (v > entryPx and v < tpPx) : (v < entryPx and v > tpPx)
+            if inRange and (na(best) or (isBull ? v < best : v > best))
+                best := v
+            k -= 1
+    best
+
+// Alternativni BE: na TEJ sveči je bila pobrana likvidnost na strani
+// minusa (long = pivot low pod entryjem), ki je nastala po entryju,
+// cena pa je bila MED tem pivotom in sweepom že v profitu.
+f_altSweep(bool isBull, float entryPx, int entryT, int profT) =>
+    bool found = false
+    int n = isBull ? array.size(sweptLowTimes) : array.size(sweptHighTimes)
+    if n > 0 and not na(profT) and not na(entryT)
+        int k = n - 1
+        while k >= 0
+            int evT = isBull ? array.get(sweptLowTimes, k) : array.get(sweptHighTimes, k)
+            if evT != time
+                break
+            float v   = isBull ? array.get(sweptLowLevels, k) : array.get(sweptHighLevels, k)
+            int   pvT = isBull ? array.get(sweptLowPivotTimes, k) : array.get(sweptHighPivotTimes, k)
+            if (isBull ? v < entryPx : v > entryPx) and pvT >= entryT and profT > pvT
+                found := true
+                break
+            k -= 1
+    found
+
+// Komentar izhoda glede na to, kje je SL: v profitu = TRAIL, na entryju = BE, v minusu = SL
+f_lossComment(bool isLong, float sl, float entry) =>
+    (isLong ? sl > entry : sl < entry) ? "TRAIL" : sl == entry ? "BE" : "SL"
+
+bool inPos      = strategy.position_size != 0
+bool justOpened = inPos and nz(strategy.position_size[1]) == 0
+
+if justOpened
+    posLong   := strategy.position_size > 0
+    posEntry  := pendEntry
+    posTP     := pendTP
+    posSL     := pendSL
+    posRisk   := math.abs(pendEntry - pendSL)
+    posBE     := false
+    posEntryT := time
+    posExt    := pendEntry
+    posProfT  := na
+    posAltBE  := na
+
+// BE - SL na entry, a nikoli slabše od že premaknjenega trail SL-ja
+if inPos and not posBE
+    float lv = f_sweptThisBar(posLong, posEntry, posTP)
+    string why = "likvidnost"
+    if na(lv) and useAltBE and not na(posAltBE) and (posLong ? high >= posAltBE : low <= posAltBE)
+        lv  := posAltBE
+        why := "max od entryja"
+    if not na(lv)
+        posBE := true
+        if posLong
+            beHitLong := true
+            beLvlLong := lv
+        else
+            beHitShort := true
+            beLvlShort := lv
+        if posLong ? posEntry > posSL : posEntry < posSL
+            posSL := posEntry
+            strategy.exit(posLong ? "XL" : "XS", from_entry = posLong ? "Long" : "Short", stop = posSL, limit = posTP, comment_profit = "TP", comment_loss = f_lossComment(posLong, posSL, posEntry))
+        if alertOnEntry
+            alert("🔵 BE (" + why + ") - " + syminfo.ticker + " " + (posLong ? "LONG" : "SHORT") + " pri " + str.tostring(lv, format.mintick) + ", SL na entry " + str.tostring(posEntry, format.mintick), alertFreq)
+    else if useAltBE and na(posAltBE) and f_altSweep(posLong, posEntry, posEntryT, posProfT)
+        posAltBE := posExt
+
+// Posodobi max/min in zadnjo svečo v profitu
+if inPos and not justOpened
+    posExt := posLong ? math.max(posExt, high) : math.min(posExt, low)
+    if posLong ? high > posEntry : low < posEntry
+        posProfT := time
+
+// TRAILING SL - higher low (long) / lower high (short), nastal PO entry sveči
+if useTrail and inPos and not justOpened
+    float pivLvl  = posLong ? (isHL ? trailPL : na) : (isLH ? trailPH : na)
+    bool  started = trailStartR <= 0 or (posLong ? posExt - posEntry : posEntry - posExt) >= posRisk * trailStartR
+    if not na(pivLvl) and trailPivT > posEntryT and started
+        float newSL  = posLong ? pivLvl - trailBuffer : pivLvl + trailBuffer
+        bool  better = posLong ? newSL > posSL : newSL < posSL
+        bool  safe   = posLong ? newSL < close : newSL > close
+        if better and safe
+            posSL := newSL
+            trailMoved := true
+            if posLong ? posSL >= posEntry : posSL <= posEntry
+                posBE := true
+            strategy.exit(posLong ? "XL" : "XS", from_entry = posLong ? "Long" : "Short", stop = posSL, limit = posTP, comment_profit = "TP", comment_loss = f_lossComment(posLong, posSL, posEntry))
+            if alertOnEntry
+                alert("🟣 TRAIL SL - " + syminfo.ticker + " " + (posLong ? "LONG" : "SHORT") + " → SL " + str.tostring(posSL, format.mintick), alertFreq)
+
+if inPos
+    // Med odprto pozicijo ni novih vstopov
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+else
+    // Poišči najnovejši setup, ki čaka na vstop
+    int cand = -1
+    if array.size(fibZoneTop) > 0
+        for k = array.size(fibZoneTop) - 1 to 0
+            float cLvl = f_fibLevel(array.get(fibExtreme, k), array.get(fibFixed, k))
+            if f_dirAllowed(array.get(fibIsBull, k)) and array.get(fibHasExtended, k) and cLvl >= array.get(fibZoneBottom, k) and cLvl <= array.get(fibZoneTop, k)
+                cand := k
+                break
+
+    bool placed = false
+    if cand >= 0 and inSession and not blackoutNext
+        bool  cBull = array.get(fibIsBull, cand)
+        float ePx   = cBull ? array.get(fibZoneTop, cand) : array.get(fibZoneBottom, cand)
+        float sPx   = array.get(fibFixed, cand)
+        float sPts  = math.abs(ePx - sPx)
+        if sPts > 0
+            float qty = math.min(riskPerTrade / (sPts * syminfo.pointvalue), maxLots)
+            [tpS, srcS] = f_targets(cBull, ePx, sPts)
+            pendLong  := cBull
+            pendEntry := ePx
+            pendTP    := tpS
+            pendSL    := sPx
+            string id = cBull ? "Long" : "Short"
+            strategy.cancel(cBull ? "Short" : "Long")
+            strategy.entry(id, cBull ? strategy.long : strategy.short, qty = qty, limit = ePx, comment = id + " → " + srcS)
+            strategy.exit(cBull ? "XL" : "XS", from_entry = id, stop = sPx, limit = tpS, comment_profit = "TP", comment_loss = "SL")
+            placed := true
+    if not placed
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+
+
+// ══════════════════════════════════════════════════════════════════════
+// STATISTIKA TP / TRAIL / SL / BE
+// ══════════════════════════════════════════════════════════════════════
+
+var int nTP = 0
+var int nTR = 0
+var int nSL = 0
+var int nBE = 0
+var int nCounted = 0
+
+while nCounted < strategy.closedtrades
+    string exC = strategy.closedtrades.exit_comment(nCounted)
+    if exC == "TP"
+        nTP += 1
+    else if exC == "TRAIL"
+        nTR += 1
+    else if exC == "BE"
+        nBE += 1
+    else
+        nSL += 1
+    nCounted += 1
+
+f_statsPos() =>
+    statsPos == "Top left" ? position.top_left : statsPos == "Bottom right" ? position.bottom_right : statsPos == "Bottom left" ? position.bottom_left : position.top_right
+
+var table statsTbl = table.new(f_statsPos(), 2, 8, bgcolor = color.new(color.black, 80), border_color = color.new(color.gray, 60), border_width = 1, frame_color = color.new(color.gray, 40), frame_width = 2)
+
+f_statRow(int r, string name, string val, color bg) =>
+    table.cell(statsTbl, 0, r, name, text_color = color.white, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(statsTbl, 1, r, val,  text_color = color.white, bgcolor = bg, text_size = size.small)
+
+if showStats and barstate.islast
+    int total = nTP + nTR + nSL + nBE
+    int wins  = nTP + nTR
+    color neutral = color.new(color.gray, 60)
+    f_statRow(0, "Trade-i", str.tostring(total), neutral)
+    f_statRow(1, "TP", str.tostring(nTP), color.new(color.green, 60))
+    f_statRow(2, "TRAIL (v profitu)", str.tostring(nTR), color.new(color.fuchsia, 60))
+    f_statRow(3, "SL", str.tostring(nSL), color.new(color.red, 60))
+    f_statRow(4, "BE", str.tostring(nBE), color.new(color.aqua, 60))
+    f_statRow(5, "Win rate (TP+TRAIL / vse)", total > 0 ? str.tostring(wins * 100.0 / total, "#.#") + " %" : "—", neutral)
+    f_statRow(6, "Win rate brez BE", (wins + nSL) > 0 ? str.tostring(wins * 100.0 / (wins + nSL), "#.#") + " %" : "—", neutral)
+    f_statRow(7, "Net profit", str.tostring(strategy.netprofit, "#.##"), strategy.netprofit >= 0 ? color.new(color.green, 60) : color.new(color.red, 60))
+
+
+// ══════════════════════════════════════════════════════════════════════
+// ENTRY ALERT - TAKOJ OB SPROŽITVI VSTOPA
+// ══════════════════════════════════════════════════════════════════════
+
+if alertOnEntry and (up or dn)
+    string enMsg = (up ? "🟢 LONG ENTRY" : "🔴 SHORT ENTRY") + "  " + SETUP_GRADE +
+         "\n" + syminfo.ticker +
+         "\nEntry " + str.tostring(up ? long_price : short_price, format.mintick) +
+         "\nSL " + str.tostring(up ? long_sl : short_sl, format.mintick) +
+         "\nTP " + str.tostring(up ? long_TP : short_TP, format.mintick) + " (" + entryTPSrc + ")" +
+         "\nKontrakti: " + (na(entryContracts) ? "n/a" : str.tostring(entryContracts, "#.##")) +
+         "\nČas: " + str.format_time(time, "HH:mm", sessTZ)
+    alert(enMsg, alertFreq)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// NEAREST HTF FVGs + DRAWING
+// ══════════════════════════════════════════════════════════════════════
+
+int nearestBullIdx = -1
+float nearestBullDist = 1e15
+int nearestBearIdx = -1
+float nearestBearDist = 1e15
+
+if array.size(fvgTop) > 0
+    for i = 0 to array.size(fvgTop) - 1
+        if array.get(fvgBull, i)
+            float top = array.get(fvgTop, i)
+            if top <= close and close - top < nearestBullDist
+                nearestBullDist := close - top
+                nearestBullIdx := i
+        else
+            float bot = array.get(fvgBot, i)
+            if bot >= close and bot - close < nearestBearDist
+                nearestBearDist := bot - close
+                nearestBearIdx := i
+
+var box bullBox = na
+var box bearBox = na
+var label bullLabel = na
+var label bearLabel = na
+
+if showFVG
+    box.delete(bullBox)
+    box.delete(bearBox)
+    label.delete(bullLabel)
+    label.delete(bearLabel)
+    bullBox := na
+    bearBox := na
+    bullLabel := na
+    bearLabel := na
+
+    int drawingRightTime = time + (time - time[1]) * 20
+
+    if nearestBullIdx >= 0
+        float top = array.get(fvgTop, nearestBullIdx)
+        float bot = array.get(fvgBot, nearestBullIdx)
+        bullBox := box.new(left = array.get(fvgOriginTime, nearestBullIdx), top = top, right = drawingRightTime, bottom = bot, xloc = xloc.bar_time, border_color = color.new(color.gray, 50), bgcolor = color.new(color.gray, 85))
+        bullLabel := label.new(x = drawingRightTime, y = (top + bot) / 2, text = array.get(fvgTF, nearestBullIdx) + " FVG", xloc = xloc.bar_time, style = label.style_label_left, textcolor = color.gray, color = #00000000, size = size.tiny)
+
+    if nearestBearIdx >= 0
+        float top = array.get(fvgTop, nearestBearIdx)
+        float bot = array.get(fvgBot, nearestBearIdx)
+        bearBox := box.new(left = array.get(fvgOriginTime, nearestBearIdx), top = top, right = drawingRightTime, bottom = bot, xloc = xloc.bar_time, border_color = color.new(color.gray, 50), bgcolor = color.new(color.gray, 85))
+        bearLabel := label.new(x = drawingRightTime, y = (top + bot) / 2, text = array.get(fvgTF, nearestBearIdx) + " FVG", xloc = xloc.bar_time, style = label.style_label_left, textcolor = color.gray, color = #00000000, size = size.tiny)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// GRADING LINE NEXT TO ENTRY WITH HOVER TOOLTIP
+// ══════════════════════════════════════════════════════════════════════
+
+if showGradeLine and (up or dn)
+    float entryPx = up ? long_price : short_price
+    color gradeCol = up ? longGradeLineColor : shortGradeLineColor
+    if not na(entryPx)
+        string tt = "SETUP GRADE: " + SETUP_GRADE + "\n"
+        tt += "Direction: " + (up ? "LONG" : "SHORT") + "\n"
+        tt += "─────────────\n"
+        tt += "Entry: " + str.tostring(entryPx, format.mintick) + "\n"
+        tt += "Stop: " + str.tostring(up ? long_sl : short_sl, format.mintick) + "\n"
+        float tpPx = up ? long_TP : short_TP
+        tt += "Target: " + str.tostring(tpPx, format.mintick) + " (" + entryTPSrc + ")"
+        tt += entryStopPts > 0 ? "  = " + str.tostring(math.abs(tpPx - entryPx) / entryStopPts, "#.##") + "R\n" : "\n"
+        tt += "BE: ko cena po entryju pobere prvo likvidnost\n"
+        tt += "TRAIL: SL na vsak nov " + (up ? "higher low" : "lower high") + "\n"
+        tt += "─────────────\n"
+        tt += "Risk per trade: " + str.tostring(riskPerTrade, "#.##") + "\n"
+        tt += "Stop distance: " + str.tostring(entryStopPts, "#.##") + " points\n"
+        tt += "Value per point: " + str.tostring(valuePerPoint, "#.##") + " per contract\n"
+        tt += "─────────────\n"
+        tt += "CONTRACTS TO ENTER: " + (na(entryContracts) ? "n/a" : str.tostring(entryContracts, "#.##")) + (not na(entryContracts) and entryContracts >= maxLots ? "  (MAX LIMIT)" : "") + "\n"
+        tt += "Dejanski risk: " + (na(entryContracts) ? "n/a" : str.tostring(entryContracts * entryStopPts * valuePerPoint, "#.##"))
+
+        line.new(x1 = bar_index, y1 = entryPx, x2 = bar_index + gradeLineBars, y2 = entryPx, color = gradeCol, width = gradeLineWidth)
+        label.new(x = bar_index + gradeLineBars + 1, y = entryPx, text = SETUP_GRADE,
+             style = label.style_label_left, textcolor = gradeCol, color = color.new(gradeCol, 85),
+             size = size.normal, tooltip = tt)
+
+
+// ══════════════════════════════════════════════════════════════════════
+// SIGNAL MARKERS (entry / SL / TP circles)
+// ══════════════════════════════════════════════════════════════════════
+
+plotshape(up and showMarkers ? long_price : na, location = location.absolute, style = shape.circle, color = longEntryDotColor, size = size.tiny, title = "Long entry")
+plotshape(up and showMarkers ? long_sl : na, location = location.absolute, style = shape.circle, color = slDotColor, size = size.tiny, title = "Long SL")
+plotshape(dn and showMarkers ? short_price : na, location = location.absolute, style = shape.circle, color = shortEntryDotColor, size = size.tiny, title = "Short entry")
+plotshape(dn and showMarkers ? short_sl : na, location = location.absolute, style = shape.circle, color = slDotColor, size = size.tiny, title = "Short SL")
+
+plotshape(up and showMarkers and showTP ? long_TP : na, location = location.absolute, style = shape.circle, color = tpDotColor, size = size.tiny, title = "Long TP")
+plotshape(dn and showMarkers and showTP ? short_TP : na, location = location.absolute, style = shape.circle, color = tpDotColor, size = size.tiny, title = "Short TP")
+
+// BE krog se nariše na sveči, ki po entryju pobere prvo likvidnost
+plotshape(beHitLong and showMarkers and showBE ? beLvlLong : na, location = location.absolute, style = shape.circle, color = beDotColor, size = size.tiny, title = "Long BE")
+plotshape(beHitShort and showMarkers and showBE ? beLvlShort : na, location = location.absolute, style = shape.circle, color = beDotColor, size = size.tiny, title = "Short BE")
+
+// Trailing SL: črta trenutnega SL med tradeom + romb ob vsakem premiku
+plot(showTrailLine and inPos ? posSL : na, "Trail SL", color = trailLineColor, linewidth = 2, style = plot.style_linebr)
+plotshape(trailMoved and showMarkers ? posSL : na, location = location.absolute, style = shape.diamond, color = trailLineColor, size = size.tiny, title = "Trail SL premik")
