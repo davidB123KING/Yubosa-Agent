@@ -1,0 +1,273 @@
+//@version=6
+// Sweep pozicije - samo vizualno
+// 1) Swingi (HH / LH / HL / LL) z dolzino 21 -> to so nivoji za ENTRY (samo iz istega dneva)
+// 2) Likvidnost 5 levo / 5 desno -> to so tocke za SL
+// Opcije: zacetek dneva (npr. 23:00) in pogoj za start (HH+LL / HH ali LL / takoj)
+// Ko se cena dotakne se nedotaknjenega swinga iz istega dneva:
+//   - vrh (HH / LH) -> LONG
+//   - dno (HL / LL) -> SHORT
+// SL = prejsnja likvidnostna tocka (5/5) na pravi strani, TP = 1R
+
+indicator("Sweep pozicije (vizualno)", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ---------- INPUTI ----------
+grpD = "Trading dan"
+tz   = input.string("Europe/Ljubljana", "Casovni pas za 00:00",
+     options = ["Europe/Ljubljana", "America/New_York", "Etc/UTC"], group = grpD)
+dayHour = input.int(0, "Zacetek dneva (ura)", minval = 0, maxval = 23, group = grpD,
+     tooltip = "0 = dan se zacne ob 00:00 (kot prej).\n23 = dan se zacne ob 23:00, ko se trg odpre.")
+startMode = input.string("HH + LL", "Pogoj za zacetek setupov",
+     options = ["HH + LL", "HH ali LL", "Takoj (brez pogoja)"], group = grpD,
+     tooltip = "HH + LL: kot prej - setupi sele, ko sta v dnevu potrjena HH in LL.\nHH ali LL: dovolj je eden od njiju.\nTakoj: setupi takoj od zacetka dneva, ce je nivo swinga iz tega dneva.")
+
+grpS   = "Swingi (HH / LH / HL / LL)"
+swLen  = input.int(21, "Dolzina swinga (sveč levo in desno)", minval = 1, group = grpS)
+colHi  = input.color(color.red,  "Vrhovi", group = grpS)
+colLo  = input.color(color.teal, "Dna",    group = grpS)
+
+grpLQ   = "Likvidnost (za SL)"
+lqLeft  = input.int(5, "Sveč levo",  minval = 1, group = grpLQ)
+lqRight = input.int(5, "Sveč desno", minval = 1, group = grpLQ)
+showLiq = input.bool(true, "Prikazi likvidnostne tocke", group = grpLQ)
+liqSize = input.int(3, "Velikost pikice", minval = 1, maxval = 6, group = grpLQ)
+
+grpP    = "Pozicija"
+rr      = input.float(1.0, "RR (TP = RR x SL)", minval = 0.1, step = 0.1, group = grpP)
+maxBars = input.int(300, "Max. trajanje pozicije (sveč)", minval = 1, group = grpP)
+showTbl = input.bool(true, "Prikazi statistiko", group = grpP)
+multi   = input.bool(false, "Vec tradov naenkrat", group = grpP,
+     tooltip = "Vklopljeno: vsak nivo, ki ga sveca z body-jem zapre, odpre svojo pozicijo, tudi ce so druge se aktivne.\nIzklopljeno: samo ena pozicija naenkrat.")
+useBE   = input.bool(true, "Break even", group = grpP,
+     tooltip = "Ko je trade v profitu za izbran % tveganja, se SL premakne na entry.\nPrimer: risk 50 EUR, 50 % -> pri +25 EUR gre SL na BE.")
+beTrig  = input.float(50, "   BE ko je profit (% od R)", minval = 1, maxval = 99, step = 5, group = grpP)
+// ---------- NOV DAN ----------
+// premik casa: pri zacetku ob 23:00 se 23:00 steje ze kot naslednji dan
+dayShift = dayHour == 0 ? 0 : (24 - dayHour) * 3600000
+dom    = dayofmonth(time + dayShift, tz)
+newDay = dom != dom[1]
+
+// ali so setupi v tem dnevu ze dovoljeni
+ready(bool hh, bool ll) =>
+    startMode == "Takoj (brez pogoja)" ? true : startMode == "HH ali LL" ? (hh or ll) : (hh and ll)
+
+var int          dayStart = na
+var bool         gotHH    = false   // HH ze bil v tem dnevu
+var bool         gotLL    = false   // LL ze bil v tem dnevu
+var array<float> hiLvl = array.new<float>()
+var array<int>   hiT   = array.new<int>()
+var array<float> loLvl = array.new<float>()
+var array<int>   loT   = array.new<int>()
+
+if newDay
+    dayStart := time
+    gotHH    := false
+    gotLL    := false
+    array.clear(hiLvl)
+    array.clear(hiT)
+    array.clear(loLvl)
+    array.clear(loT)
+
+bgcolor(newDay ? color.new(color.gray, 80) : na, title = "Zacetek dneva")
+// ---------- POZICIJE ----------
+type Pos
+    int   dir
+    float entry
+    float sl
+    float tp
+    int   startBar
+    box   tpBox
+    box   slBox
+    float risk
+    bool  be = false
+
+var array<Pos> poss = array.new<Pos>()
+var int nTP = 0
+var int nSL = 0
+var int nBE = 0
+
+// 1) posodobi odprte pozicije (TP / SL)
+bool closedNow = false
+if array.size(poss) > 0
+    for i = array.size(poss) - 1 to 0
+        p = array.get(poss, i)
+        box.set_right(p.tpBox, bar_index)
+        box.set_right(p.slBox, bar_index)
+        hitTP = p.dir == 1 ? high >= p.tp : low  <= p.tp
+        hitSL = p.dir == 1 ? low  <= p.sl : high >= p.sl
+        if hitTP or hitSL or bar_index - p.startBar >= maxBars
+            // ce sta na isti sveci oba, stejemo SL (konzervativno)
+            if hitSL and p.be
+                nBE += 1
+                label.new(bar_index, p.sl, "BE", style = p.dir == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+            else if hitSL
+                nSL += 1
+                label.new(bar_index, p.sl, "SL", style = p.dir == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+            else if hitTP
+                nTP += 1
+                label.new(bar_index, p.tp, "TP", style = p.dir == 1 ? label.style_label_down : label.style_label_up,
+                     color = color.new(color.green, 20), textcolor = color.white, size = size.tiny)
+            array.remove(poss, i)
+            closedNow := true
+        // BREAK EVEN: ce je trade dosegel X % od R, SL gre na entry (velja od naslednje sveče,
+        // ker znotraj ene sveče ne vemo, ali je bil prej dosezen profit ali SL)
+        else if useBE and not p.be
+            trig = p.entry + p.dir * p.risk * beTrig / 100
+            if p.dir == 1 ? high >= trig : low <= trig
+                p.be := true
+                p.sl := p.entry
+                box.set_top(p.slBox, p.entry)
+                box.set_bottom(p.slBox, p.entry)
+                box.set_text(p.slBox, "")
+                label.new(bar_index, trig, "→BE", style = p.dir == 1 ? label.style_label_down : label.style_label_up,
+                     color = color.new(color.gray, 40), textcolor = color.white, size = size.tiny)
+
+// 2) dotik nedotaknjenega swinga iz istega dneva
+float touchHi = na   // najnizji dotaknjen vrh
+float touchLo = na   // najvisje dotaknjeno dno
+
+if array.size(hiLvl) > 0
+    for i = array.size(hiLvl) - 1 to 0
+        lvl = array.get(hiLvl, i)
+        // samo BODY close nad vrhom steje, wick sweep ne (nivo ostane ziv)
+        if close > lvl
+            if na(touchHi) or lvl < touchHi
+                touchHi := lvl
+            line.new(array.get(hiT, i), lvl, time, lvl, xloc = xloc.bar_time,
+                 style = line.style_dashed, color = colHi)
+            array.remove(hiLvl, i)
+            array.remove(hiT,   i)
+
+if array.size(loLvl) > 0
+    for i = array.size(loLvl) - 1 to 0
+        lvl = array.get(loLvl, i)
+        // samo BODY close pod dnom steje, wick sweep ne (nivo ostane ziv)
+        if close < lvl
+            if na(touchLo) or lvl > touchLo
+                touchLo := lvl
+            line.new(array.get(loT, i), lvl, time, lvl, xloc = xloc.bar_time,
+                 style = line.style_dashed, color = colLo)
+            array.remove(loLvl, i)
+            array.remove(loT,   i)
+
+// ---------- LIKVIDNOST 5/5 (za SL) ----------
+var array<float> liqHi = array.new<float>()
+var array<float> liqLo = array.new<float>()
+
+// prejsnja (najnovejsa) likvidnostna tocka pod / nad ceno
+prevLiq(array<float> a, float px, bool below) =>
+    float r = na
+    if array.size(a) > 0
+        for i = array.size(a) - 1 to 0
+            v = array.get(a, i)
+            if below ? v < px : v > px
+                r := v
+                break
+    r
+
+newPos(int d, float e, float s) =>
+    risk = math.abs(e - s)
+    t    = d == 1 ? e + rr * risk : e - rr * risk
+    tb = box.new(bar_index, math.max(e, t), bar_index + 1, math.min(e, t),
+         border_color = color.new(color.green, 40), bgcolor = color.new(color.green, 80),
+         text = (d == 1 ? "LONG" : "SHORT") + "  TP " + str.tostring(t, format.mintick),
+         text_color = color.green, text_size = size.small, text_halign = text.align_left)
+    sb = box.new(bar_index, math.max(e, s), bar_index + 1, math.min(e, s),
+         border_color = color.new(color.red, 40), bgcolor = color.new(color.red, 80),
+         text = "SL " + str.tostring(s, format.mintick) + "  (" + str.tostring(risk, format.mintick) + ")",
+         text_color = color.red, text_size = size.small, text_halign = text.align_left)
+    Pos.new(d, e, s, t, bar_index, tb, sb, risk)
+
+// 3) odpri pozicijo - samo ce ni nobene aktivne
+//    (in ne na isti sveci, kjer se je prejsnja zaprla)
+//    nivoji, ki se jih cena dotakne med aktivnim tradom, se porabijo (ne cakajo za kasneje)
+canOpen = not na(dayStart) and ready(gotHH, gotLL) and (multi or (array.size(poss) == 0 and not closedNow))
+// ce sta na isti sveci dotaknjena vrh in dno, je smer nejasna -> brez pozicije
+// (pri "vec tradov naenkrat" se odpreta obe)
+// entry = close sveče, ki je z body-jem zaprla cez nivo
+bothHit = not na(touchHi) and not na(touchLo) and not multi
+if canOpen and not na(touchHi) and not bothHit
+    s = prevLiq(liqLo, close, true)
+    if not na(s)
+        array.push(poss, newPos(1, close, s))
+
+if canOpen and not na(touchLo) and not bothHit
+    s = prevLiq(liqHi, close, false)
+    if not na(s)
+        array.push(poss, newPos(-1, close, s))
+
+// ---------- SWINGI (HH / LH / HL / LL) ----------
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low,   swLen, swLen)
+
+var float lastPH = na
+var float lastPL = na
+wasReady = ready(gotHH, gotLL) and not newDay
+
+if not na(ph)
+    isHH = not na(lastPH) and ph > lastPH
+    label.new(bar_index - swLen, ph, na(lastPH) ? "H" : isHH ? "HH" : "LH",
+         style = label.style_label_down, color = color(na), textcolor = colHi, size = size.small)
+    if not na(dayStart) and time[swLen] >= dayStart
+        array.push(hiLvl, ph)
+        array.push(hiT,   time[swLen])
+        if isHH
+            gotHH := true
+    lastPH := ph
+
+if not na(pl)
+    isLL = not na(lastPL) and pl < lastPL
+    label.new(bar_index - swLen, pl, na(lastPL) ? "L" : isLL ? "LL" : "HL",
+         style = label.style_label_up, color = color(na), textcolor = colLo, size = size.small)
+    if not na(dayStart) and time[swLen] >= dayStart
+        array.push(loLvl, pl)
+        array.push(loT,   time[swLen])
+        if isLL
+            gotLL := true
+    lastPL := pl
+
+// zelena luc: v tem dnevu je izpolnjen izbran pogoj (pri "Takoj" = zacetek dneva)
+greenLight = not na(dayStart) and ready(gotHH, gotLL) and not wasReady
+bgcolor(greenLight ? color.new(color.green, 70) : na, title = "Zelena luc")
+if greenLight
+    label.new(bar_index, low, "START", style = label.style_label_up,
+         color = color.new(color.green, 20), textcolor = color.white, size = size.tiny)
+
+// ---------- LIKVIDNOSTNE TOCKE ----------
+lqH = ta.pivothigh(high, lqLeft, lqRight)
+lqL = ta.pivotlow(low,   lqLeft, lqRight)
+
+if not na(lqH)
+    array.push(liqHi, lqH)
+    if array.size(liqHi) > 200
+        array.shift(liqHi)
+if not na(lqL)
+    array.push(liqLo, lqL)
+    if array.size(liqLo) > 200
+        array.shift(liqLo)
+
+plot(showLiq ? lqH : na, "Buy-side likvidnost",  style = plot.style_circles, offset = -lqRight, color = colHi, linewidth = liqSize)
+plot(showLiq ? lqL : na, "Sell-side likvidnost", style = plot.style_circles, offset = -lqRight, color = colLo, linewidth = liqSize)
+
+// ---------- STATISTIKA ----------
+var table tbl = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 30), border_width = 1)
+if showTbl and barstate.islast
+    tot  = nTP + nSL
+    totA = nTP + nSL + nBE
+    netR = nTP * rr - nSL
+    table.cell(tbl, 0, 0, "TP", text_color = color.green)
+    table.cell(tbl, 1, 0, str.tostring(nTP), text_color = color.white)
+    table.cell(tbl, 0, 1, "SL", text_color = color.red)
+    table.cell(tbl, 1, 1, str.tostring(nSL), text_color = color.white)
+    table.cell(tbl, 0, 2, "BE", text_color = color.gray)
+    table.cell(tbl, 1, 2, str.tostring(nBE), text_color = color.white)
+    table.cell(tbl, 0, 3, "Winrate (brez BE)", text_color = color.white)
+    table.cell(tbl, 1, 3, tot > 0 ? str.tostring(100.0 * nTP / tot, "#.#") + " %" : "-", text_color = color.white)
+    table.cell(tbl, 0, 4, "Winrate (vsi)", text_color = color.white)
+    table.cell(tbl, 1, 4, totA > 0 ? str.tostring(100.0 * nTP / totA, "#.#") + " %" : "-", text_color = color.white)
+    table.cell(tbl, 0, 5, "Skupaj R", text_color = color.white)
+    table.cell(tbl, 1, 5, str.tostring(netR, "#.##") + " R", text_color = netR >= 0 ? color.green : color.red)
+    table.cell(tbl, 0, 6, "Odprte", text_color = color.white)
+    table.cell(tbl, 1, 6, str.tostring(array.size(poss)), text_color = color.white)
